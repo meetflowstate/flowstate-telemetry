@@ -1,0 +1,62 @@
+version: 2
+
+project_name: flowstate-telemetry
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: flowstate-telemetry
+    main: .
+    binary: flowstate-telemetry
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/meetflowstate/flowstate-telemetry/cmd.version={{.Version}}
+      - -X github.com/meetflowstate/flowstate-telemetry/cmd.commit={{.Commit}}
+      - -X github.com/meetflowstate/flowstate-telemetry/cmd.date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+brews:
+  - name: flowstate-telemetry
+    repository:
+      owner: meetflowstate
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://www.flowstate.inc"
+    description: "Configure AI coding tools to emit telemetry to Flowstate"
+    license: "MIT"
+    install: |
+      bin.install "flowstate-telemetry"
+    test: |
+      system "#{bin}/flowstate-telemetry", "status"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: meetflowstate
+    name: flowstate-telemetry
+  prerelease: auto

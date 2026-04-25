@@ -12,6 +12,12 @@ builds:
     binary: flowstate-telemetry
     env:
       - CGO_ENABLED=0
+    # NOTE: Windows targets (windows/amd64, windows/arm64) are intentionally
+    # absent — they are scheduled for a follow-up branch alongside the
+    # Windows trust/service/PAC implementation in internal/platform/windows.go.
+    # Adding them here without the platform code would ship a binary whose
+    # `proxy install` command returns errNotImplemented, which is worse than
+    # not shipping the target. See workstream-A plan §"Goreleaser changes".
     goos:
       - darwin
       - linux

@@ -1,3 +1,9 @@
+## [1.2.0](https://github.com/meetflowstate/flowstate-telemetry/compare/v1.1.0...v1.2.0) (2026-04-25)
+
+### Features
+
+* **cli:** wire --version flag and version subcommand ([63455c7](https://github.com/meetflowstate/flowstate-telemetry/commit/63455c7186efa6f40f12f27d0e79368b0ea5616d))
+
 ## [1.1.0](https://github.com/meetflowstate/flowstate-telemetry/compare/v1.0.0...v1.1.0) (2026-04-25)
 
 ### Features

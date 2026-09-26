@@ -2,12 +2,15 @@ name: Dependabot auto-merge
 
 # Approves and merges a Dependabot PR only when ALL of these hold:
 #   1. The PR was opened by Dependabot and targets the default branch.
-#   2. Every commit on the PR was authored by Dependabot and carries a
+#   2. Every commit on the PR was authored by Dependabot, committed by
+#      Dependabot (or GitHub's web-flow on its behalf), and carries a
 #      GitHub-verified signature. If anyone else pushes to the branch, it is
 #      never approved.
 #   3. The commit being merged is still the PR's head (no newer push).
 #   4. No dependency moves a major version (or a 0.x minor, which semver treats
-#      as breaking). Those get the needs-human-review label instead.
+#      as breaking), read from the PR title, body and commit messages. Those,
+#      and any PR whose versions can't be read, get the needs-human-review
+#      label instead.
 #
 # This repo has no CI that runs on pull requests, so nothing is tested before
 # the merge: a passing update is merged on the checks above alone. When CI is
@@ -42,7 +45,7 @@ jobs:
       REQUIRE_CI: 'false'
     steps:
       - name: Verify, approve and merge
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -66,30 +69,42 @@ jobs:
             if (pr.base.ref !== repoInfo.default_branch) return skip(`PR #${pr.number} targets ${pr.base.ref}`);
             if (pr.head.repo.full_name !== `${owner}/${repo}`) return skip('PR head is in another repository');
 
-            // 2. Every commit must be Dependabot's, with a verified signature.
+            // 2. Every commit must be Dependabot's (as author and committer), with a verified signature.
             const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
             for (const c of commits) {
               const author = c.author && c.author.login;
+              const committer = c.committer && c.committer.login;
               const v = c.commit.verification;
               if (author !== BOT) return skip(`commit ${c.sha.slice(0, 7)} was authored by ${author || c.commit.author.email}`);
+              if (committer !== BOT && committer !== 'web-flow') return skip(`commit ${c.sha.slice(0, 7)} was committed by ${committer || c.commit.committer.email}`);
               if (!v || !v.verified || v.reason !== 'valid') return skip(`commit ${c.sha.slice(0, 7)} has no valid signature (${v ? v.reason : 'none'})`);
             }
 
-            // 3. Major versions wait for a person.
-            const messages = commits.map(c => c.commit.message).join('\n');
+            // 3. Major versions wait for a person. Versions are read from the PR title and
+            //    body (grouped PRs list them in a table) as well as the commit messages.
+            const text = [pr.title || '', pr.body || '', ...commits.map(c => c.commit.message)].join('\n');
             const majorOf = (ver) => {
               const parts = ver.replace(/^v/, '').replace(/\.+$/, '').split('.').map(n => parseInt(n, 10));
               if (parts.some(Number.isNaN)) return null;
               return parts[0] === 0 ? `0.${parts[1] ?? 0}` : String(parts[0]);
             };
-            const pairs = [...messages.matchAll(/from `?v?([0-9][0-9A-Za-z.+-]*)`? to `?v?([0-9][0-9A-Za-z.+-]*)`?/g)];
-            const declaredMajor = /update-type:\s*version-update:semver-major/.test(messages);
+            const pairs = [
+              ...[...text.matchAll(/from `?v?([0-9][0-9A-Za-z.+-]*)`? to `?v?([0-9][0-9A-Za-z.+-]*)`?/g)].map(m => [m[1], m[2]]),
+              // Grouped-PR table rows: | [name](url) | `1.2.3` | `1.2.4` |
+              ...[...text.matchAll(/^\|\s*\[[^\]]*\]\([^)]*\)\s*\|\s*`v?([0-9][0-9A-Za-z.+-]*)`\s*\|\s*`v?([0-9][0-9A-Za-z.+-]*)`\s*\|/gm)].map(m => [m[1], m[2]]),
+            ];
+            const declaredMajor = /update-type:\s*version-update:semver-major/.test(text);
             const unparsed = pairs.length === 0;
-            const bumpsMajor = pairs.some(([, from, to]) => {
+            const bumpsMajor = pairs.some(([from, to]) => {
               const a = majorOf(from), b = majorOf(to);
               return a === null || b === null || a !== b;
             });
             if (declaredMajor || bumpsMajor || unparsed) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: 'needs-human-review', color: 'd93f0b', description: 'Dependabot update that needs a person to review it' });
+              } catch (e) {
+                if (e.status !== 422) throw e; // 422: the label already exists
+              }
               await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ['needs-human-review'] });
               return skip(unparsed ? 'could not read the versions from the commit messages' : 'major version change');
             }
@@ -124,7 +139,11 @@ jobs:
             const methods = ['squash', 'merge', 'rebase'];
             for (let i = 0; i < methods.length; i++) {
               try {
-                await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, sha, merge_method: methods[i] });
+                const { data: result } = await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, sha, merge_method: methods[i] });
+                if (result.merged !== true) {
+                  core.setFailed(`PR #${pr.number} was not merged: ${result.message || 'no reason given'}`);
+                  return;
+                }
                 core.notice(`Merged PR #${pr.number} at ${sha} (${methods[i]})`);
                 return;
               } catch (e) {

@@ -1,0 +1,154 @@
+name: Dependabot auto-merge
+
+# Approves and merges a Dependabot PR only when ALL of these hold:
+#   1. The PR was opened by Dependabot and targets the default branch.
+#   2. Every commit on the PR was authored by Dependabot, committed by
+#      Dependabot (or GitHub's web-flow on its behalf), and carries a
+#      GitHub-verified signature. If anyone else pushes to the branch, it is
+#      never approved.
+#   3. The commit being merged is still the PR's head (no newer push).
+#   4. No dependency moves a major version (or a 0.x minor, which semver treats
+#      as breaking), read from the PR title, body and commit messages. Those,
+#      and any PR whose versions can't be read, get the needs-human-review
+#      label instead.
+#
+# This repo has no CI that runs on pull requests, so nothing is tested before
+# the merge: a passing update is merged on the checks above alone. When CI is
+# added, switch this to the workflow_run trigger and REQUIRE_CI: 'true'.
+#
+# It runs on Dependabot's pull_request events. It never checks out or runs
+# code from the PR; it only reads the PR through the API.
+#
+# Repo settings this needs:
+#   - Settings → Actions → General: "Allow GitHub Actions to create and
+#     approve pull requests"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: false
+
+jobs:
+  approve-and-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_CI: 'false'
+    steps:
+      - name: Verify, approve and merge
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const requireCi = process.env.REQUIRE_CI !== 'false';
+            const sha = requireCi ? context.payload.workflow_run.head_sha : context.payload.pull_request.head.sha;
+            const BOT = 'dependabot[bot]';
+            const skip = (why) => core.notice(`Not merging ${sha}: ${why}`);
+
+            // 1. Find the open PR whose head is this commit.
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            let pr;
+            if (requireCi) {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+              pr = prs.find(p => p.state === 'open' && p.head.sha === sha);
+            } else {
+              const { data: fresh } = await github.rest.pulls.get({ owner, repo, pull_number: context.payload.pull_request.number });
+              pr = fresh.state === 'open' && fresh.head.sha === sha ? fresh : undefined;
+            }
+            if (!pr) return skip('no open PR whose head is this commit (a newer push, or already merged)');
+            if (pr.user.login !== BOT) return skip(`PR #${pr.number} was opened by ${pr.user.login}`);
+            if (pr.base.ref !== repoInfo.default_branch) return skip(`PR #${pr.number} targets ${pr.base.ref}`);
+            if (pr.head.repo.full_name !== `${owner}/${repo}`) return skip('PR head is in another repository');
+
+            // 2. Every commit must be Dependabot's (as author and committer), with a verified signature.
+            const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+            for (const c of commits) {
+              const author = c.author && c.author.login;
+              const committer = c.committer && c.committer.login;
+              const v = c.commit.verification;
+              if (author !== BOT) return skip(`commit ${c.sha.slice(0, 7)} was authored by ${author || c.commit.author.email}`);
+              if (committer !== BOT && committer !== 'web-flow') return skip(`commit ${c.sha.slice(0, 7)} was committed by ${committer || c.commit.committer.email}`);
+              if (!v || !v.verified || v.reason !== 'valid') return skip(`commit ${c.sha.slice(0, 7)} has no valid signature (${v ? v.reason : 'none'})`);
+            }
+
+            // 3. Major versions wait for a person. Versions are read from the PR title and
+            //    body (grouped PRs list them in a table) as well as the commit messages.
+            const text = [pr.title || '', pr.body || '', ...commits.map(c => c.commit.message)].join('\n');
+            const majorOf = (ver) => {
+              const parts = ver.replace(/^v/, '').replace(/\.+$/, '').split('.').map(n => parseInt(n, 10));
+              if (parts.some(Number.isNaN)) return null;
+              return parts[0] === 0 ? `0.${parts[1] ?? 0}` : String(parts[0]);
+            };
+            const pairs = [
+              ...[...text.matchAll(/from `?v?([0-9][0-9A-Za-z.+-]*)`? to `?v?([0-9][0-9A-Za-z.+-]*)`?/g)].map(m => [m[1], m[2]]),
+              // Grouped-PR table rows: | [name](url) | `1.2.3` | `1.2.4` |
+              ...[...text.matchAll(/^\|\s*\[[^\]]*\]\([^)]*\)\s*\|\s*`v?([0-9][0-9A-Za-z.+-]*)`\s*\|\s*`v?([0-9][0-9A-Za-z.+-]*)`\s*\|/gm)].map(m => [m[1], m[2]]),
+            ];
+            const declaredMajor = /update-type:\s*version-update:semver-major/.test(text);
+            const unparsed = pairs.length === 0;
+            const bumpsMajor = pairs.some(([from, to]) => {
+              const a = majorOf(from), b = majorOf(to);
+              return a === null || b === null || a !== b;
+            });
+            if (declaredMajor || bumpsMajor || unparsed) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: 'needs-human-review', color: 'd93f0b', description: 'Dependabot update that needs a person to review it' });
+              } catch (e) {
+                if (e.status !== 422) throw e; // 422: the label already exists
+              }
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ['needs-human-review'] });
+              return skip(unparsed ? 'could not read the versions from the commit messages' : 'major version change');
+            }
+
+            // 4. Every check and status on this commit has finished and passed.
+            //    Skipped entirely when REQUIRE_CI is 'false' (a repo with no PR CI).
+            let checkSummary = 'this repo has no CI, so no checks were required';
+            if (requireCi) {
+              const ok = new Set(['success', 'skipped', 'neutral']);
+              const checks = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, per_page: 100 });
+              const others = checks.filter(c => c.name !== 'approve-and-merge');
+              if (others.length === 0) return skip('no CI checks ran on this commit');
+              const pending = others.filter(c => c.status !== 'completed');
+              if (pending.length) return skip(`still running: ${pending.map(c => c.name).join(', ')}`);
+              const failed = others.filter(c => !ok.has(c.conclusion));
+              if (failed.length) return skip(`not passing: ${failed.map(c => `${c.name}=${c.conclusion}`).join(', ')}`);
+              const { data: combined } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+              if (combined.total_count > 0 && combined.state !== 'success') return skip(`commit status is ${combined.state}`);
+              checkSummary = `all ${others.length} checks on ${sha.slice(0, 7)} passed`;
+            }
+
+            // 5. Approve (once) and merge exactly this commit.
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+            const already = reviews.some(r => r.state === 'APPROVED' && r.commit_id === sha && r.user.login === 'github-actions[bot]');
+            if (!already) {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number: pr.number, commit_id: sha, event: 'APPROVE',
+                body: `Automated approval: every commit is a verified Dependabot commit, no major version change, and ${checkSummary}.`,
+              });
+            }
+            // Squash if the repo allows it; if that merge method is disabled (405), fall back to merge, then rebase.
+            const methods = ['squash', 'merge', 'rebase'];
+            for (let i = 0; i < methods.length; i++) {
+              try {
+                const { data: result } = await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, sha, merge_method: methods[i] });
+                if (result.merged !== true) {
+                  core.setFailed(`PR #${pr.number} was not merged: ${result.message || 'no reason given'}`);
+                  return;
+                }
+                core.notice(`Merged PR #${pr.number} at ${sha} (${methods[i]})`);
+                return;
+              } catch (e) {
+                const methodDisabled = e.status === 405 && /not allowed/i.test(e.message || '');
+                if (!methodDisabled || i === methods.length - 1) throw e;
+                core.info(`${methods[i]} merges are disabled here; trying ${methods[i + 1]}`);
+              }
+            }

@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/hooks"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 	"github.com/meetflowstate/flowstate-telemetry/internal/tools"
 	"github.com/spf13/cobra"
@@ -27,13 +28,19 @@ Use --all to configure every detected tool, or --tool <name> to target
 a specific tool. Use --dry-run to preview changes without writing files.
 
 Every tool sends OTLP over HTTP (protobuf or JSON) to the Flowstate
-receiver; gRPC is never configured.
+receiver; gRPC is never configured. The key is scoped to each tool (its own
+settings, or a wrapper function in the shell profile); it is never exported
+as OTEL_EXPORTER_OTLP_HEADERS, which every OpenTelemetry SDK would send to
+its own collector.
 
-On macOS, apps opened from the Dock (VS Code, Cursor, Windsurf) do not read
-the shell profile. --gui-env also publishes FLOWSTATE_OTLP_ENDPOINT,
-FLOWSTATE_OTLP_KEY and OTEL_EXPORTER_OTLP_HEADERS with 'launchctl setenv'
-and installs a LaunchAgent that repeats it at login. Those variables are
-then visible to every GUI app you run, so it is opt-in.`,
+The retired endpoint https://otel.flowstate.inc is ignored (treated as unset)
+and every file that named it is rewritten.
+
+On macOS, --gui-env also publishes FLOWSTATE_OTLP_ENDPOINT and
+FLOWSTATE_OTLP_KEY with 'launchctl setenv' and installs a LaunchAgent that
+repeats it at login. Hook scripts already read ~/.config/flowstate-telemetry/env,
+so this is rarely needed; the variables are visible to every GUI app you run,
+so it is opt-in.`,
 	RunE: runInstall,
 }
 
@@ -41,7 +48,7 @@ func init() {
 	installCmd.Flags().StringVar(&flagInstallTool, "tool", "", "Install only this tool (e.g. claude-code, copilot-chat)")
 	installCmd.Flags().BoolVar(&flagInstallAll, "all", false, "Install for all detected tools")
 	installCmd.Flags().BoolVar(&flagInstallDryRun, "dry-run", false, "Show what would be changed without writing")
-	installCmd.Flags().BoolVar(&flagInstallPrompts, "prompts", false, "Enable prompt/content capture where supported")
+	installCmd.Flags().BoolVar(&flagInstallPrompts, "prompts", false, "Log prompt/response content where supported (not recommended: Flowstate drops it, so it only leaves the machine)")
 	installCmd.Flags().BoolVar(&flagInstallGUIEnv, "gui-env", false, "macOS: also expose the env vars to Dock-launched apps via launchctl setenv")
 	rootCmd.AddCommand(installCmd)
 }
@@ -63,6 +70,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	if cfg.Key == "" && !cfg.DryRun {
 		fmt.Fprintln(os.Stderr, "Warning: no API key set. Use --key or FLOWSTATE_OTLP_KEY env var.")
+	}
+	if cfg.IgnoredLegacyEndpoint != "" {
+		fmt.Fprintf(os.Stderr, "Note: ignoring the retired endpoint %s; using %s\n", cfg.IgnoredLegacyEndpoint, cfg.BaseEndpoint())
 	}
 
 	var toolsToInstall []tools.Tool
@@ -102,6 +112,22 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Printf("%s%s: configured\n", prefix, t.Name())
 			succeeded++
+			if n, ok := t.(tools.Noter); ok {
+				for _, note := range n.InstallNotes(cfg) {
+					fmt.Printf("%s  note: %s\n", prefix, note)
+				}
+			}
+		}
+	}
+
+	// Hook scripts in editors read this file. A hook tool's Install rewrites
+	// it; also refresh one left by an earlier install (it may name the
+	// retired endpoint) when no hook tool was installed this time.
+	if _, err := os.Stat(hooks.EnvFilePath()); err == nil {
+		if cfg.DryRun {
+			fmt.Printf("  [dry-run] Would rewrite %s\n", hooks.EnvFilePath())
+		} else if err := hooks.WriteEnvFile(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not rewrite %s: %v\n", hooks.EnvFilePath(), err)
 		}
 	}
 
@@ -118,7 +144,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if cfg.GUIEnv {
+	// A LaunchAgent from an earlier install may publish the retired endpoint
+	// and OTEL_EXPORTER_OTLP_HEADERS: refresh it even without --gui-env.
+	if cfg.GUIEnv || (shell.GUIEnvSupported() && shell.GUIEnvInstalled()) {
 		if err := shell.InstallGUIEnv(cfg, cfg.DryRun); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: could not set GUI environment: %v\n", err)
 		} else if !cfg.DryRun {
@@ -131,7 +159,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Summary: %d configured, %d failed\n", succeeded, failed)
 	if !cfg.DryRun {
 		fmt.Println("Run 'flowstate-telemetry status' to verify configuration.")
-		fmt.Println("Run 'source " + shell.ProfilePath() + "' to load env vars in current shell.")
+		fmt.Println("Open a new terminal (or run 'source " + shell.ProfilePath() + "') to load the env vars and wrapper functions.")
 	}
 
 	if failed > 0 {

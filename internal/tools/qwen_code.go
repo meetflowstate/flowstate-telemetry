@@ -8,14 +8,16 @@ import (
 	"path/filepath"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
 // QwenCode configures telemetry for Alibaba's Qwen Code CLI.
 //
 // Same telemetry block as Gemini CLI (it is a fork), except Qwen has no
-// header setting: the key reaches it only through OTEL_EXPORTER_OTLP_HEADERS
-// from the shell profile block. With otlpProtocol "http" it appends
-// /v1/{logs,metrics,traces} and sends OTLP/HTTP JSON.
+// header setting: the key reaches it only through OTEL_EXPORTER_OTLP_HEADERS,
+// set by a `qwen` wrapper function in the shell profile (never exported
+// globally). With otlpProtocol "http" it appends /v1/{logs,metrics,traces}
+// and sends OTLP/HTTP JSON.
 type QwenCode struct{}
 
 func (q *QwenCode) Name() string { return "qwen-code" }
@@ -81,14 +83,18 @@ func (q *QwenCode) Install(cfg config.Config) error {
 	}
 
 	settings["telemetry"] = telemetry
+	block := geminiStyleBlock("qwen", "Qwen Code", true)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")
-		fmt.Printf("[dry-run] Would write to %s:\n%s\n", q.settingsPath(), string(data))
-		return nil
+		fmt.Printf("[dry-run] Would write to %s:\n%s\n", q.settingsPath(), redactKey(string(data), cfg.Key))
+		return shell.WriteToolBlock(q.Name(), block, true)
 	}
 
-	return q.writeSettings(settings)
+	if err := q.writeSettings(settings); err != nil {
+		return err
+	}
+	return shell.WriteToolBlock(q.Name(), block, false)
 }
 
 func (q *QwenCode) Remove() error {
@@ -99,7 +105,10 @@ func (q *QwenCode) Remove() error {
 
 	delete(settings, "telemetry")
 
-	return q.writeSettings(settings)
+	if err := q.writeSettings(settings); err != nil {
+		return err
+	}
+	return shell.RemoveToolBlock(q.Name())
 }
 
 func (q *QwenCode) Status() ToolStatus {
@@ -150,5 +159,5 @@ func (q *QwenCode) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: "telemetry not enabled"}
 	}
 
-	return verifyGeminiStyle(telemetry, cfg, "QWEN_TELEMETRY_OTLP_ENDPOINT", false)
+	return verifyGeminiStyle(telemetry, cfg, "QWEN_TELEMETRY_OTLP_ENDPOINT", q.Name(), "qwen", false)
 }

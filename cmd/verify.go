@@ -31,23 +31,19 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	hasErrors := false
 	hasWarnings := false
 
-	for _, t := range tools.All() {
-		if !t.Detect() {
-			fmt.Printf("\u2013  %-16s not detected on PATH\n", t.Name())
-			continue
-		}
-
-		result := t.Verify(cfg)
-
+	report := func(name string, result tools.VerifyResult) {
 		if result.OK {
 			if result.Warning != "" {
-				fmt.Printf("\u26a0  %-16s %s\n", t.Name(), result.Warning)
+				fmt.Printf("\u26a0  %-16s %s\n", name, result.Warning)
 				hasWarnings = true
 			} else {
-				fmt.Printf("\u2713  %-16s %s\n", t.Name(), result.Message)
+				fmt.Printf("\u2713  %-16s %s\n", name, result.Message)
 			}
 		} else {
-			fmt.Printf("\u2717  %-16s %s\n", t.Name(), result.Message)
+			fmt.Printf("\u2717  %-16s %s\n", name, result.Message)
+			if result.Warning != "" {
+				fmt.Printf("\u26a0  %-16s %s\n", "", result.Warning)
+			}
 			hasErrors = true
 		}
 		for _, note := range result.Notes {
@@ -55,13 +51,26 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if cfg.IgnoredLegacyEndpoint != "" {
+		fmt.Printf("   %-16s note: ignoring retired endpoint %s; checking against %s\n", "", cfg.IgnoredLegacyEndpoint, cfg.BaseEndpoint())
+	}
+	report("environment", tools.VerifyEnvironment(cfg))
+
+	for _, t := range tools.All() {
+		if !t.Detect() {
+			fmt.Printf("\u2013  %-16s not detected on PATH\n", t.Name())
+			continue
+		}
+		report(t.Name(), t.Verify(cfg))
+	}
+
 	if hasErrors || hasWarnings {
 		fmt.Fprintln(os.Stderr)
 		if hasErrors {
-			fmt.Fprintln(os.Stderr, "Some tools have configuration errors. Run 'flowstate-telemetry install --all' to fix.")
+			fmt.Fprintln(os.Stderr, "Some checks failed. Run 'flowstate-telemetry install --all' to fix.")
 		}
 		if hasWarnings {
-			fmt.Fprintln(os.Stderr, "Some tools have warnings. Run 'flowstate-telemetry install --all --prompts' for full capture.")
+			fmt.Fprintln(os.Stderr, "Some checks have warnings; see the lines marked \u26a0 above.")
 		}
 		os.Exit(1)
 	}

@@ -92,20 +92,44 @@ var (
 )
 
 // stripCodexOTel removes every [otel] / [otel.*] table from raw TOML text,
-// keeping all other lines (and comments) untouched.
+// keeping all other lines (and comments) untouched. Comment and blank lines
+// at the end of an [otel] table that run straight into a following non-otel
+// table header belong to that table, so they are kept.
 func stripCodexOTel(raw string) string {
 	lines := strings.SplitAfter(raw, "\n")
-	var out []string
+	var out, pending []string
 	inOTel := false
 	for _, line := range lines {
 		if m := tableHeader.FindStringSubmatch(line); m != nil {
+			wasOTel := inOTel
 			inOTel = otelTable.MatchString(m[1])
+			if wasOTel && !inOTel {
+				out = appendPending(out, pending)
+			}
+			pending = nil
 		}
 		if !inOTel {
 			out = append(out, line)
+			continue
+		}
+		if t := strings.TrimSpace(line); t == "" || strings.HasPrefix(t, "#") {
+			pending = append(pending, line)
+		} else {
+			pending = nil
 		}
 	}
 	return strings.TrimRight(strings.Join(out, ""), "\n")
+}
+
+// appendPending appends the comment block kept from the end of an [otel]
+// table, without doubling a blank line that out already ends with.
+func appendPending(out, pending []string) []string {
+	if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		for len(pending) > 0 && strings.TrimSpace(pending[0]) == "" {
+			pending = pending[1:]
+		}
+	}
+	return append(out, pending...)
 }
 
 // mergeCodexOTel returns raw with its [otel] tables replaced by block.
@@ -222,6 +246,9 @@ func (c *CodexCLI) Verify(cfg config.Config) VerifyResult {
 			return VerifyResult{OK: false, Message: fmt.Sprintf("otel.%s is not otlp-http (gRPC is not accepted)", s.key)}
 		}
 		endpoint, _ := exp["endpoint"].(string)
+		if r := legacyEndpoint("otel."+s.key+" endpoint", endpoint); r != nil {
+			return *r
+		}
 		if !strings.HasSuffix(endpoint, "/v1/"+s.signal) {
 			return VerifyResult{OK: false, Message: fmt.Sprintf("otel.%s endpoint %q must end in /v1/%s", s.key, endpoint, s.signal)}
 		}
@@ -235,12 +262,27 @@ func (c *CodexCLI) Verify(cfg config.Config) VerifyResult {
 	}
 
 	result := VerifyResult{OK: true, Message: fmt.Sprintf("config.toml present · OTLP/HTTP endpoint=%s", cfg.BaseEndpoint())}
-	if p, _ := otel["log_user_prompt"].(bool); !p {
-		warnings = append(warnings, "log_user_prompt not enabled (re-run with --prompts)")
+	if p, _ := otel["log_user_prompt"].(bool); p {
+		warnings = append(warnings, promptsOnWarning("log_user_prompt"))
+	}
+	if !c.analyticsEnabled() {
+		warnings = append(warnings, "[analytics] enabled = false: Codex exports no OTLP metrics (tokens, cost, tool calls) with it off; set it to true or remove it")
 	}
 	result.Warning = strings.Join(warnings, "; ")
 
 	return result
+}
+
+// analyticsEnabled reports whether Codex's [analytics] is on (the default).
+// Codex only exports OTLP metrics when it is.
+func (c *CodexCLI) analyticsEnabled() bool {
+	cfg, err := c.readConfig()
+	if err != nil {
+		return true
+	}
+	analytics, _ := cfg["analytics"].(map[string]interface{})
+	enabled, ok := analytics["enabled"].(bool)
+	return !ok || enabled
 }
 
 // tomlString renders s as a TOML basic string.

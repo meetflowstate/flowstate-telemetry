@@ -36,7 +36,7 @@ func ProfilePath() string {
 // user's shell profile, surrounded by marker comments for easy identification
 // and removal.
 func WriteEnvVars(cfg config.Config, dryRun bool) error {
-	return writeBlock(markerStart, markerEnd, buildEnvBlock(cfg), dryRun)
+	return writeBlock(markerStart, markerEnd, buildEnvBlock(cfg), dryRun, cfg.Key)
 }
 
 // RemoveEnvVars removes the Flowstate telemetry block, and every tool block
@@ -65,7 +65,7 @@ var toolMarkerPattern = regexp.MustCompile(`(?m)^# --- Flowstate Telemetry: ([A-
 func WriteToolBlock(tool string, lines []string, dryRun bool) error {
 	start, end := toolMarkers(tool)
 	block := strings.Join(append(append([]string{start}, lines...), end), "\n")
-	return writeBlock(start, end, block, dryRun)
+	return writeBlock(start, end, block, dryRun, "")
 }
 
 // RemoveToolBlock removes the block written by WriteToolBlock for tool.
@@ -81,16 +81,51 @@ func HasToolBlock(tool string) bool {
 	return err == nil && strings.Contains(string(data), start)
 }
 
+// ToolBlock returns the text of tool's block in the shell profile, or "".
+func ToolBlock(tool string) string {
+	start, end := toolMarkers(tool)
+	return blockText(ProfileText(), start, end)
+}
+
+// MainBlock returns the text of the shared Flowstate block, or "".
+func MainBlock() string {
+	return blockText(ProfileText(), markerStart, markerEnd)
+}
+
+// ProfileText returns the shell profile's contents ("" when missing).
+func ProfileText() string {
+	data, _ := os.ReadFile(ProfilePath())
+	return string(data)
+}
+
+func blockText(content, start, end string) string {
+	i := strings.Index(content, start)
+	if i == -1 {
+		return ""
+	}
+	j := strings.Index(content[i:], end)
+	if j == -1 {
+		return ""
+	}
+	return content[i : i+j+len(end)]
+}
+
 func toolMarkers(tool string) (string, string) {
 	return fmt.Sprintf("# --- Flowstate Telemetry: %s ---", tool),
 		fmt.Sprintf("# --- End Flowstate Telemetry: %s ---", tool)
 }
 
-func writeBlock(start, end, block string, dryRun bool) error {
+// writeBlock replaces the block between start and end. secret is redacted
+// from dry-run output.
+func writeBlock(start, end, block string, dryRun bool, secret string) error {
 	profilePath := ProfilePath()
 
 	if dryRun {
-		fmt.Printf("[dry-run] Would append to %s:\n%s\n", profilePath, block)
+		shown := block
+		if secret != "" {
+			shown = strings.ReplaceAll(shown, secret, "<redacted>")
+		}
+		fmt.Printf("[dry-run] Would append to %s:\n%s\n", profilePath, shown)
 		return nil
 	}
 
@@ -127,11 +162,12 @@ func removeBlock(start, end string) error {
 
 // buildEnvBlock renders the shared profile block.
 //
-// OTEL_EXPORTER_OTLP_HEADERS is exported because Copilot Chat (and the
-// Gemini/Qwen CLIs, as a fallback) can only take OTLP headers from the
-// environment. Every Flowstate-configured tool uses the same key, so sharing
-// it is safe for them; tools with their own header config (Claude Code,
-// Codex, OpenCode) override it.
+// Only FLOWSTATE_* variables carry the endpoint and key: no OpenTelemetry SDK
+// reads them. OTEL_EXPORTER_OTLP_HEADERS is never exported, because every
+// OTel SDK started from the shell would then send the Flowstate key to its
+// own collector (and a user's own value would be clobbered). Each tool gets
+// the key from its own settings, or from a wrapper function scoped to that
+// one command (WriteToolBlock).
 //
 // OTEL_RESOURCE_ATTRIBUTES deliberately carries no service.name: each tool
 // sets its own, and overriding it would make every tool look the same.
@@ -142,7 +178,6 @@ func buildEnvBlock(cfg config.Config) string {
 
 	if cfg.Key != "" {
 		lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_KEY=%q", cfg.Key))
-		lines = append(lines, fmt.Sprintf("export OTEL_EXPORTER_OTLP_HEADERS=%q", cfg.HeadersEnv()))
 	}
 
 	if attrs := ResourceAttributes(cfg); attrs != "" {

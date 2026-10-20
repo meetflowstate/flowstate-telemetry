@@ -14,7 +14,8 @@ import (
 )
 
 // The hook scripts are exercised for real: bash runs them with sample stdin,
-// jq builds the payload, and a stub curl on PATH records its arguments.
+// jq builds the payload, and a stub curl on PATH records its arguments and
+// its stdin (where the key header goes).
 // Every sample carries SECRET markers in prompt text, file contents, paths
 // and commands; none may reach the request.
 
@@ -122,13 +123,19 @@ var hookCases = []hookCase{
 	},
 }
 
+// curlCall is what the stub curl saw.
+type curlCall struct {
+	args  []string
+	stdin string
+}
+
 // runHook runs script with stdin and returns its stdout and the stub curl's
-// arguments (nil when curl was not called).
-func runHook(t *testing.T, script, hook, stdin string, env []string) (string, []string) {
+// call (nil when curl was not called).
+func runHook(t *testing.T, script, hook, stdin string, env []string) (string, *curlCall) {
 	return runHookWait(t, script, hook, stdin, env, 3*time.Second)
 }
 
-func runHookWait(t *testing.T, script, hook, stdin string, env []string, wait time.Duration) (string, []string) {
+func runHookWait(t *testing.T, script, hook, stdin string, env []string, wait time.Duration) (string, *curlCall) {
 	t.Helper()
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "hook.sh")
@@ -140,7 +147,7 @@ func runHookWait(t *testing.T, script, hook, stdin string, env []string, wait ti
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "curl.args")
-	stub := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"$CURL_OUT.tmp\" && mv \"$CURL_OUT.tmp\" \"$CURL_OUT\"\n"
+	stub := "#!/bin/sh\ncat > \"$CURL_OUT.stdin\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"$CURL_OUT.tmp\" && mv \"$CURL_OUT.tmp\" \"$CURL_OUT\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(stub), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +173,11 @@ func runHookWait(t *testing.T, script, hook, stdin string, env []string, wait ti
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(out); err == nil {
-			return strings.TrimSpace(stdout.String()), strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+			in, _ := os.ReadFile(out + ".stdin")
+			return strings.TrimSpace(stdout.String()), &curlCall{
+				args:  strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00"),
+				stdin: string(in),
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -233,28 +244,36 @@ func TestHookScripts(t *testing.T) {
 			if tc.noSend {
 				wait = 300 * time.Millisecond
 			}
-			stdout, args := runHookWait(t, tc.script, tc.hook, tc.stdin, env, wait)
+			stdout, call := runHookWait(t, tc.script, tc.hook, tc.stdin, env, wait)
 			if tc.stdout != "" && stdout != tc.stdout {
 				t.Fatalf("stdout = %q, want %q", stdout, tc.stdout)
 			}
 			if tc.noSend {
-				if args != nil {
-					t.Fatalf("expected no request, curl got %q", args)
+				if call != nil {
+					t.Fatalf("expected no request, curl got %q", call.args)
 				}
 				return
 			}
-			if args == nil {
+			if call == nil {
 				t.Fatal("curl was not called")
 			}
+			args := call.args
 
 			joined := strings.Join(args, " ")
-			if strings.Contains(joined, "SECRET") {
+			if strings.Contains(joined+call.stdin, "SECRET") {
 				t.Fatalf("request leaks content: %s", joined)
 			}
-			for _, want := range []string{"https://otel.example/v1/logs", "x-flowstate-key: test-key", "Content-Type: application/json", "--max-time"} {
+			for _, want := range []string{"https://otel.example/v1/logs", "Content-Type: application/json", "--max-time", "@-"} {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("curl args missing %q: %q", want, args)
 				}
+			}
+			// The key must not be on curl's command line (visible in ps).
+			if strings.Contains(joined, "test-key") {
+				t.Fatalf("key on curl's command line: %q", args)
+			}
+			if call.stdin != "x-flowstate-key: test-key\n" {
+				t.Fatalf("curl stdin = %q, want the key header", call.stdin)
 			}
 
 			var payload otlpLogs
@@ -308,24 +327,50 @@ func TestHookScripts_EndpointAndKeyFallback(t *testing.T) {
 	if err := WriteEnvFile(config.Config{Endpoint: "https://file.example", Key: "file-key"}); err != nil {
 		t.Fatal(err)
 	}
-	_, args := runHook(t, CursorHookScript, "stop", `{"conversation_id":"c"}`, []string{"XDG_CONFIG_HOME=" + confHome})
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "https://file.example/v1/logs") || !strings.Contains(joined, "x-flowstate-key: file-key") {
-		t.Fatalf("env file not used: %q", args)
+	_, call := runHook(t, CursorHookScript, "stop", `{"conversation_id":"c"}`, []string{"XDG_CONFIG_HOME=" + confHome})
+	if !containsArg(call.args, "https://file.example/v1/logs") || call.stdin != "x-flowstate-key: file-key\n" {
+		t.Fatalf("env file not used: %q / %q", call.args, call.stdin)
+	}
+
+	// A stale FLOWSTATE_OTLP_ENDPOINT naming the retired receiver (an editor
+	// started from a shell before the profile was rewritten) is ignored in
+	// favour of the env file.
+	_, call = runHook(t, CursorHookScript, "stop", `{"conversation_id":"c"}`,
+		[]string{"XDG_CONFIG_HOME=" + confHome, "FLOWSTATE_OTLP_ENDPOINT=https://otel.flowstate.inc"})
+	if !containsArg(call.args, "https://file.example/v1/logs") {
+		t.Fatalf("legacy env endpoint used: %q", call.args)
 	}
 
 	// Nothing configured at all: default endpoint, no key header.
-	_, args = runHook(t, WindsurfHookScript, "post_cascade_response", `{"trajectory_id":"t"}`, nil)
-	joined = strings.Join(args, " ")
-	if !strings.Contains(joined, "https://otel.flowstate.host/v1/logs") || strings.Contains(joined, "x-flowstate-key") {
-		t.Fatalf("default endpoint wrong: %q", args)
+	_, call = runHook(t, WindsurfHookScript, "post_cascade_response", `{"trajectory_id":"t"}`, nil)
+	joined := strings.Join(call.args, " ")
+	if !containsArg(call.args, "https://otel.flowstate.host/v1/logs") || strings.Contains(joined, "@-") || call.stdin != "" {
+		t.Fatalf("default endpoint wrong: %q / %q", call.args, call.stdin)
+	}
+
+	// A legacy endpoint everywhere (env and an old env file) falls back to
+	// the default.
+	legacyHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(legacyHome, "flowstate-telemetry"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyHome, "flowstate-telemetry", "env"),
+		[]byte("FLOWSTATE_OTLP_ENDPOINT=https://otel.flowstate.inc/v1/logs\nFLOWSTATE_OTLP_KEY=k\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, script := range []string{CursorHookScript, WindsurfHookScript, AntigravityHookScript} {
+		_, call = runHook(t, script, "stop", `{"conversation_id":"c","trajectory_id":"t","conversationId":"a"}`,
+			[]string{"XDG_CONFIG_HOME=" + legacyHome, "FLOWSTATE_OTLP_ENDPOINT=otel.flowstate.inc:4317"})
+		if call == nil || !containsArg(call.args, "https://otel.flowstate.host/v1/logs") {
+			t.Fatalf("legacy endpoint not replaced by the default: %+v", call)
+		}
 	}
 
 	// An endpoint that already names the logs path is not doubled.
-	_, args = runHook(t, AntigravityHookScript, "Stop", `{"conversationId":"a"}`,
+	_, call = runHook(t, AntigravityHookScript, "Stop", `{"conversationId":"a"}`,
 		[]string{"FLOWSTATE_OTLP_ENDPOINT=https://x.example/v1/logs"})
-	if !containsArg(args, "https://x.example/v1/logs") {
-		t.Fatalf("endpoint wrong: %q", args)
+	if !containsArg(call.args, "https://x.example/v1/logs") {
+		t.Fatalf("endpoint wrong: %q", call.args)
 	}
 }
 

@@ -6,5 +6,9 @@
   "github.copilot.chat.otel.headers": {
     "x-flowstate-key": "fs_test_key"
   },
-  "github.copilot.chat.otel.otlpEndpoint": "https://otel.flowstate.host"
+  "github.copilot.chat.otel.otlpEndpoint": "https://otel.flowstate.host",
+  "settingsSync.ignoredSettings": [
+    "editor.fontSize",
+    "github.copilot.chat.otel.headers"
+  ]
 }

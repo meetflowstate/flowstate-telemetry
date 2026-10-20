@@ -159,8 +159,12 @@ func verifyHookTool(detected bool, product, script, hooksPath string, registered
 		return VerifyResult{OK: false, Message: fmt.Sprintf("Flowstate hooks missing from %s", hooksPath)}
 	}
 	var warnings []string
-	if _, err := os.Stat(hooks.EnvFilePath()); err != nil && os.Getenv("FLOWSTATE_OTLP_KEY") == "" {
+	envFile, err := os.ReadFile(hooks.EnvFilePath())
+	if err != nil && os.Getenv("FLOWSTATE_OTLP_KEY") == "" {
 		warnings = append(warnings, fmt.Sprintf("%s missing: hooks will post without a key", hooks.EnvFilePath()))
+	}
+	if config.ContainsLegacyEndpoint(string(envFile)) {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("%s points at the retired otel.flowstate.inc receiver: re-run `flowstate-telemetry install`", hooks.EnvFilePath())}
 	}
 	if !commandAvailable("jq") || !commandAvailable("curl") {
 		warnings = append(warnings, "jq and curl are required by the hook script")

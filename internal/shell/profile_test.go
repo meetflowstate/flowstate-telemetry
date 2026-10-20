@@ -29,12 +29,79 @@ func TestBuildEnvBlock_Golden(t *testing.T) {
 	want := `# --- Flowstate Telemetry ---
 export FLOWSTATE_OTLP_ENDPOINT="https://otel.flowstate.host"
 export FLOWSTATE_OTLP_KEY="fs_key"
-export OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=fs_key"
 export OTEL_RESOURCE_ATTRIBUTES="flowstate.team_id=team-1,flowstate.email=dev@example.com"
 # --- End Flowstate Telemetry ---`
 	if got := buildEnvBlock(cfg); got != want {
 		t.Fatalf("block mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
+}
+
+// The key must never be exported as OTEL_EXPORTER_OTLP_HEADERS: every OTel
+// SDK started from the shell would send it to its own collector.
+func TestBuildEnvBlock_NoGlobalOTelHeaders(t *testing.T) {
+	got := buildEnvBlock(config.Config{Endpoint: "https://otel.flowstate.host", Key: "k"})
+	if strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || strings.Contains(got, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+		t.Fatalf("block exports generic OTel variables:\n%s", got)
+	}
+}
+
+func TestWriteEnvVars_DryRunRedactsKey(t *testing.T) {
+	profile := sandbox(t)
+	out := captureStdout(t, func() {
+		if err := WriteEnvVars(config.Config{Endpoint: "https://otel.flowstate.host", Key: "sekrit-key"}, true); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "sekrit-key") || !strings.Contains(out, "<redacted>") {
+		t.Fatalf("dry-run output not redacted:\n%s", out)
+	}
+	if _, err := os.Stat(profile); !os.IsNotExist(err) {
+		t.Fatal("dry-run wrote the profile")
+	}
+}
+
+// Upgrading rewrites a block written by an older release (legacy endpoint,
+// global OTEL_EXPORTER_OTLP_HEADERS).
+func TestWriteEnvVars_ReplacesLegacyBlock(t *testing.T) {
+	profile := sandbox(t)
+	old := "export PATH=/x\n\n" + markerStart + "\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport FLOWSTATE_OTLP_KEY=\"k\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\n" + markerEnd + "\n"
+	if err := os.WriteFile(profile, []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteEnvVars(config.Config{Endpoint: config.DefaultEndpoint, Key: "k"}, false); err != nil {
+		t.Fatal(err)
+	}
+	got := ProfileText()
+	if config.ContainsLegacyEndpoint(got) || strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || !strings.Contains(MainBlock(), config.DefaultEndpoint) {
+		t.Fatalf("legacy block survived:\n%s", got)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	done := make(chan string)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			b.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		done <- b.String()
+	}()
+	fn()
+	_ = w.Close()
+	return <-done
 }
 
 func TestBuildEnvBlock_NoServiceNameAndOmitsEmptyAttributes(t *testing.T) {
@@ -134,9 +201,9 @@ func TestInstallGUIEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
+		"launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS",
 		"launchctl setenv FLOWSTATE_OTLP_ENDPOINT https://otel.flowstate.host",
 		"launchctl setenv FLOWSTATE_OTLP_KEY k'ey",
-		"launchctl setenv OTEL_EXPORTER_OTLP_HEADERS x-flowstate-key=k'ey",
 	}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls:\n%s", strings.Join(calls, "\n"))
@@ -147,6 +214,9 @@ func TestInstallGUIEnv(t *testing.T) {
 	}
 	if !strings.Contains(string(plist), `/bin/launchctl setenv FLOWSTATE_OTLP_KEY &#39;k&#39;\&#39;&#39;ey&#39;`) {
 		t.Fatalf("plist not quoted/escaped:\n%s", plist)
+	}
+	if strings.Contains(string(plist), "OTEL_EXPORTER_OTLP_HEADERS") {
+		t.Fatalf("plist publishes OTEL_EXPORTER_OTLP_HEADERS:\n%s", plist)
 	}
 	if st, _ := os.Stat(GUIEnvAgentPath()); st.Mode().Perm() != 0600 {
 		t.Fatalf("plist mode = %v, want 0600", st.Mode().Perm())

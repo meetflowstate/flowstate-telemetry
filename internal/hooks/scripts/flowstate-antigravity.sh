@@ -5,7 +5,7 @@
 # hook JSON on stdin. Antigravity does not put the event name in the payload,
 # so it is passed as the first argument. Posts one OTLP/HTTP JSON log record
 # to <endpoint>/v1/logs carrying ids, the model, the tool name, line counts
-# and file extensions. It never sends tool arguments, file contents, paths,
+# and file extensions (no leading dot). It never sends tool arguments, file contents, paths,
 # commands or the raw payload. It always prints {} and exits 0.
 
 TOOL=antigravity
@@ -20,7 +20,13 @@ command -v curl >/dev/null 2>&1 || exit 0
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/flowstate-telemetry/env"
 conf() { [ -r "$CONF" ] && sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n 1; return 0; }
-ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-$(conf FLOWSTATE_OTLP_ENDPOINT)}"
+# The retired otel.flowstate.inc receiver (exported by older releases) counts
+# as unset.
+legacy() { case "$1" in *otel.flowstate.inc|*otel.flowstate.inc[:/]*) return 0 ;; esac; return 1; }
+ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-}"
+legacy "$ENDPOINT" && ENDPOINT=""
+[ -n "$ENDPOINT" ] || ENDPOINT="$(conf FLOWSTATE_OTLP_ENDPOINT)"
+legacy "$ENDPOINT" && ENDPOINT=""
 ENDPOINT="${ENDPOINT:-https://otel.flowstate.host}"
 ENDPOINT="${ENDPOINT%/}"
 case "$ENDPOINT" in */v1/logs) ;; *) ENDPOINT="$ENDPOINT/v1/logs" ;; esac
@@ -85,9 +91,16 @@ PAYLOAD=$(printf '%s' "$INPUT" | jq -c --arg tool "$TOOL" --arg hook "$HOOK" '
     }]} end' 2>/dev/null) || exit 0
 [ -n "$PAYLOAD" ] || exit 0
 
-curl -sf --max-time 3 -X POST "$ENDPOINT" \
-  -H "Content-Type: application/json" \
-  ${KEY:+-H "x-flowstate-key: $KEY"} \
-  -d "$PAYLOAD" >/dev/null 2>&1 &
+# The key header goes to curl on stdin (-H @-), never on its command line,
+# which any local user can read with ps.
+send() {
+  if [ -n "$KEY" ]; then
+    printf 'x-flowstate-key: %s\n' "$KEY" |
+      curl -sf --max-time 3 -X POST "$ENDPOINT" -H "Content-Type: application/json" -H @- -d "$PAYLOAD"
+  else
+    curl -sf --max-time 3 -X POST "$ENDPOINT" -H "Content-Type: application/json" -d "$PAYLOAD" </dev/null
+  fi
+}
+send >/dev/null 2>&1 &
 
 exit 0

@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,10 +195,35 @@ func TestGeminiCLI_Install(t *testing.T) {
 	install(t, g, testCfg)
 	golden(t, home, "gemini.settings.json", readFile(t, g.settingsPath()))
 
+	golden(t, home, "gemini-0.65.zshrc", readFile(t, shell.ProfilePath()))
+	if res := g.Verify(testCfg); !res.OK || res.Warning != "" || len(res.Notes) != 0 {
+		t.Fatalf("verify (0.65): %+v", res)
+	}
+
+	// Older releases get the key from the wrapper only.
 	withGeminiVersion(t, "0.64.0")
 	install(t, g, testCfg)
 	if strings.Contains(readFile(t, g.settingsPath()), "otlpHeaders") {
 		t.Fatal("otlpHeaders written for a Gemini CLI that does not support it")
+	}
+	golden(t, home, "gemini-0.64.zshrc", readFile(t, shell.ProfilePath()))
+	if res := g.Verify(testCfg); !res.OK || res.Warning != "" || len(res.Notes) != 1 {
+		t.Fatalf("verify (0.64): %+v", res)
+	}
+
+	// Without the wrapper an old Gemini has no key at all.
+	if err := shell.RemoveToolBlock(g.Name()); err != nil {
+		t.Fatal(err)
+	}
+	if res := g.Verify(testCfg); res.OK {
+		t.Fatalf("verify passed without a key: %+v", res)
+	}
+
+	if err := g.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if shell.HasToolBlock(g.Name()) || strings.Contains(readFile(t, g.settingsPath()), "telemetry") {
+		t.Fatal("remove incomplete")
 	}
 }
 
@@ -221,19 +247,46 @@ func TestQwenCode_Install(t *testing.T) {
 	if strings.Contains(got, "otlpHeaders") {
 		t.Fatal("Qwen has no otlpHeaders setting")
 	}
+	golden(t, home, "qwen.zshrc", readFile(t, shell.ProfilePath()))
+	if res := q.Verify(testCfg); !res.OK || res.Warning != "" {
+		t.Fatalf("verify: %+v", res)
+	}
+	if err := q.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if shell.HasToolBlock(q.Name()) {
+		t.Fatal("qwen wrapper not removed")
+	}
 }
 
 func TestCopilotChat_Install(t *testing.T) {
 	home := sandbox(t)
 	c := &CopilotChat{}
-	writeFile(t, c.settingsPath(), `{"editor.fontSize": 13, "github.copilot.chat.otel.exporterType": "otlp-grpc"}`)
+	writeFile(t, c.settingsPath(), `{"editor.fontSize": 13, "github.copilot.chat.otel.exporterType": "otlp-grpc",
+  "settingsSync.ignoredSettings": ["editor.fontSize"]}`)
 	install(t, c, testCfg)
 	golden(t, home, "copilot-chat.settings.json", readFile(t, c.settingsPath()))
+	// Idempotent: the ignore entry is not duplicated.
+	install(t, c, testCfg)
+	if n := strings.Count(readFile(t, c.settingsPath()), `"github.copilot.chat.otel.headers"`); n != 2 {
+		t.Fatalf("headers key appears %d times, want 2 (setting + ignore entry)", n)
+	}
+	if res := c.Verify(testCfg); !res.OK || res.Warning != "" || len(res.Notes) == 0 {
+		t.Fatalf("verify: %+v", res)
+	}
+	// Even with the key in the environment, the setting is required.
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-flowstate-key=k")
+	writeFile(t, c.settingsPath(), `{"github.copilot.chat.otel.enabled": true, "github.copilot.chat.otel.exporterType": "otlp-http",
+  "github.copilot.chat.otel.otlpEndpoint": "https://otel.flowstate.host"}`)
+	if res := c.Verify(testCfg); res.OK {
+		t.Fatalf("verify passed without the headers setting: %+v", res)
+	}
 
+	install(t, c, testCfg)
 	if err := c.Remove(); err != nil {
 		t.Fatal(err)
 	}
-	if got := readFile(t, c.settingsPath()); strings.Contains(got, "copilot") || !strings.Contains(got, "fontSize") {
+	if got := readFile(t, c.settingsPath()); strings.Contains(got, "copilot") || strings.Contains(got, "settingsSync") {
 		t.Fatalf("remove result wrong:\n%s", got)
 	}
 }
@@ -374,19 +427,216 @@ func TestAntigravity_Install(t *testing.T) {
 	}
 }
 
-func TestDryRun_WritesNothing(t *testing.T) {
+func TestDryRun_WritesNothingAndRedactsKey(t *testing.T) {
 	home := sandbox(t)
 	withGeminiVersion(t, "0.65.0")
 	cfg := testCfg
 	cfg.DryRun = true
-	for _, tool := range All() {
-		if err := tool.Install(cfg); err != nil {
-			t.Fatalf("%s dry-run: %v", tool.Name(), err)
+	out := captureStdout(t, func() {
+		for _, tool := range All() {
+			if err := tool.Install(cfg); err != nil {
+				t.Fatalf("%s dry-run: %v", tool.Name(), err)
+			}
 		}
-	}
+		if err := shell.WriteEnvVars(cfg, true); err != nil {
+			t.Fatal(err)
+		}
+	})
 	entries, _ := os.ReadDir(home)
 	if len(entries) != 0 {
 		t.Fatalf("dry-run wrote files: %v", entries)
+	}
+	if strings.Contains(out, testCfg.Key) {
+		t.Fatalf("dry-run output contains the key:\n%s", out)
+	}
+	if !strings.Contains(out, "<redacted>") {
+		t.Fatalf("dry-run output shows no redacted key:\n%s", out)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	done := make(chan string)
+	go func() {
+		data, _ := io.ReadAll(r)
+		done <- string(data)
+	}()
+	fn()
+	_ = w.Close()
+	return <-done
+}
+
+// No install may export the key to every OpenTelemetry SDK: the shell
+// profile, wrapper blocks included, never exports OTEL_EXPORTER_OTLP_*.
+func TestInstall_NoGlobalOTelHeaders(t *testing.T) {
+	sandbox(t)
+	withGeminiVersion(t, "0.64.0")
+	for _, tool := range All() {
+		install(t, tool, testCfg)
+	}
+	if err := shell.WriteEnvVars(testCfg, false); err != nil {
+		t.Fatal(err)
+	}
+	profile := readFile(t, shell.ProfilePath())
+	for _, line := range strings.Split(profile, "\n") {
+		if strings.Contains(line, "OTEL_EXPORTER_OTLP") && !strings.Contains(line, " command ") {
+			t.Errorf("profile sets OTEL_EXPORTER_OTLP_* outside a wrapper: %s", line)
+		}
+		if strings.Contains(line, testCfg.Key) && !strings.HasPrefix(line, "export FLOWSTATE_OTLP_KEY=") {
+			t.Errorf("key outside FLOWSTATE_OTLP_KEY: %s", line)
+		}
+	}
+	for _, cmd := range []string{"copilot", "opencode", "gemini", "qwen"} {
+		if !strings.Contains(profile, " command "+cmd+" ") {
+			t.Errorf("no %s wrapper:\n%s", cmd, profile)
+		}
+	}
+	if res := VerifyEnvironment(testCfg); !res.OK || res.Warning != "" {
+		t.Fatalf("VerifyEnvironment after install: %+v", res)
+	}
+}
+
+func TestCodexCLI_StripKeepsCommentsOfNextTable(t *testing.T) {
+	raw := `model = "x"
+
+[otel]
+environment = "dev"
+# about otel exporters
+exporter = "none"
+
+# Fast profile: keep this comment
+[profiles.fast]
+model = "y"
+
+[otel.exporter.otlp-http]
+# inside otel
+endpoint = "https://otel.flowstate.inc/v1/logs"
+`
+	got := stripCodexOTel(raw)
+	want := `model = "x"
+
+# Fast profile: keep this comment
+[profiles.fast]
+model = "y"`
+	if got != want {
+		t.Fatalf("stripCodexOTel:\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestCodexCLI_VerifyWarnsWhenAnalyticsOff(t *testing.T) {
+	sandbox(t)
+	c := &CodexCLI{}
+	writeFile(t, c.configPath(), codexExisting) // [analytics] enabled = false
+	install(t, c, testCfg)
+	res := c.Verify(testCfg)
+	if !res.OK || !strings.Contains(res.Warning, "[analytics] enabled = false") {
+		t.Fatalf("verify: %+v", res)
+	}
+	if strings.Contains(res.Warning, "--prompts") {
+		t.Fatalf("verify recommends prompt logging: %+v", res)
+	}
+
+	writeFile(t, c.configPath(), "[analytics]\nenabled = true\n")
+	install(t, c, testCfg)
+	if res := c.Verify(testCfg); !res.OK || res.Warning != "" {
+		t.Fatalf("verify with analytics on: %+v", res)
+	}
+}
+
+// verify never recommends --prompts; it warns when prompt logging is on.
+func TestVerify_NeverRecommendsPrompts(t *testing.T) {
+	sandbox(t)
+	withGeminiVersion(t, "0.65.0")
+	for _, prompts := range []bool{false, true} {
+		cfg := testCfg
+		cfg.Prompts = prompts
+		for _, tool := range []Tool{&ClaudeCode{}, &CodexCLI{}, &GeminiCLI{}, &QwenCode{}, &CopilotChat{}} {
+			install(t, tool, cfg)
+			res := tool.Verify(cfg)
+			if strings.Contains(res.Warning+res.Message, "--prompts") && !strings.Contains(res.Warning, "without --prompts") {
+				t.Errorf("%s recommends --prompts: %+v", tool.Name(), res)
+			}
+			// Claude Code is not on PATH in tests, so it is skipped there.
+			if res.OK && prompts != strings.Contains(res.Warning, "prompt content leaves the machine") {
+				t.Errorf("%s prompts=%v warning = %q", tool.Name(), prompts, res.Warning)
+			}
+		}
+	}
+}
+
+// An earlier release left the retired endpoint in tool configs and the hook
+// env file; verify fails on each, and install rewrites them.
+func TestLegacyEndpoint_VerifyFlagsAndInstallRewrites(t *testing.T) {
+	home := sandbox(t)
+	withGeminiVersion(t, "0.65.0")
+	legacy := config.Config{Endpoint: "https://otel.flowstate.inc", Key: testCfg.Key}
+
+	g, cx, cc, cur := &GeminiCLI{}, &CodexCLI{}, &CopilotChat{}, &CursorTool{}
+	writeFile(t, cx.configPath(), "")
+	writeFile(t, filepath.Join(home, ".cursor", "x"), "")
+	writeFile(t, cc.settingsPath(), "{}")
+	for _, tool := range []Tool{g, cx, cc, cur} {
+		install(t, tool, legacy)
+		if res := tool.Verify(testCfg); res.OK || !strings.Contains(res.Message, "otel.flowstate.inc") {
+			t.Errorf("%s verify did not flag the legacy endpoint: %+v", tool.Name(), res)
+		}
+	}
+	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Message, hooks.EnvFilePath()) {
+		t.Fatalf("VerifyEnvironment did not flag the env file: %+v", res)
+	}
+
+	for _, tool := range []Tool{g, cx, cc, cur} {
+		install(t, tool, testCfg)
+		if res := tool.Verify(testCfg); !res.OK {
+			t.Errorf("%s still failing after re-install: %+v", tool.Name(), res)
+		}
+	}
+	if config.ContainsLegacyEndpoint(readFile(t, hooks.EnvFilePath())) {
+		t.Fatal("env file not rewritten")
+	}
+}
+
+func TestVerifyEnvironment(t *testing.T) {
+	home := sandbox(t)
+	old := systemEnvFiles
+	t.Cleanup(func() { systemEnvFiles = old })
+	etc := filepath.Join(home, "etc-environment")
+	systemEnvFiles = []string{etc}
+
+	if res := VerifyEnvironment(testCfg); !res.OK || res.Warning != "" {
+		t.Fatalf("clean environment: %+v", res)
+	}
+
+	t.Setenv("FLOWSTATE_OTLP_ENDPOINT", "https://otel.flowstate.inc")
+	if res := VerifyEnvironment(testCfg); res.OK {
+		t.Fatalf("legacy FLOWSTATE_OTLP_ENDPOINT not flagged: %+v", res)
+	}
+	t.Setenv("FLOWSTATE_OTLP_ENDPOINT", "")
+
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-flowstate-key=k")
+	if res := VerifyEnvironment(testCfg); !res.OK || !strings.Contains(res.Warning, "OTEL_EXPORTER_OTLP_HEADERS") {
+		t.Fatalf("global headers not warned: %+v", res)
+	}
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+
+	writeFile(t, shell.ProfilePath(), "# --- Flowstate Telemetry ---\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\n# --- End Flowstate Telemetry ---\n")
+	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Warning, "globally") {
+		t.Fatalf("legacy profile block not flagged: %+v", res)
+	}
+	if err := shell.WriteEnvVars(testCfg, false); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, etc, "PATH=/usr/bin\nOTEL_EXPORTER_OTLP_HEADERS=x-flowstate-key=k\nFLOWSTATE_OTLP_ENDPOINT=https://otel.flowstate.inc\n")
+	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Warning, etc) {
+		t.Fatalf("MDM leftovers not flagged: %+v", res)
 	}
 }
 

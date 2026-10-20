@@ -30,11 +30,11 @@ Every tool sends OpenTelemetry over plain HTTP (OTLP/HTTP, protobuf or JSON) to 
 | Tool         | macOS | Linux | Config Method                                          | Transport                                  |
 | ------------ | ----- | ----- | ------------------------------------------------------ | ------------------------------------------ |
 | Claude Code  | Yes   | Yes   | `~/.claude/settings.json` env block                    | OTLP/HTTP protobuf, delta metrics          |
-| Copilot Chat | Yes   | Yes   | VS Code `settings.json` + `OTEL_EXPORTER_OTLP_HEADERS` | OTLP/HTTP JSON                             |
-| Copilot CLI  | Yes   | Yes   | `copilot` wrapper function in the shell profile        | OTLP/HTTP protobuf (traces, metrics)       |
-| Gemini CLI   | Yes   | Yes   | `~/.gemini/settings.json`                              | OTLP/HTTP JSON                             |
+| Copilot Chat | Yes   | Yes   | VS Code `settings.json` (`…otel.headers`, 1.138+)      | OTLP/HTTP JSON                             |
+| Copilot CLI  | Yes   | Yes   | `copilot` wrapper function in the shell profile        | OTLP/HTTP protobuf (traces, delta metrics) |
+| Gemini CLI   | Yes   | Yes   | `~/.gemini/settings.json` + `gemini` wrapper           | OTLP/HTTP JSON, delta metrics              |
 | Codex CLI    | Yes   | Yes   | `~/.codex/config.toml` `[otel]`                        | OTLP/HTTP protobuf (logs, metrics, traces) |
-| Qwen Code    | Yes   | Yes   | `~/.qwen/settings.json` + `OTEL_EXPORTER_OTLP_HEADERS` | OTLP/HTTP JSON                             |
+| Qwen Code    | Yes   | Yes   | `~/.qwen/settings.json` + `qwen` wrapper               | OTLP/HTTP JSON, delta metrics              |
 | Cursor       | Yes   | Yes   | Hook script + `~/.cursor/hooks.json`                   | OTLP/HTTP JSON logs                        |
 | Windsurf     | Yes   | Yes   | Hook script + `~/.codeium/windsurf/hooks.json`         | OTLP/HTTP JSON logs                        |
 | Antigravity  | Yes   | Yes   | Hook script + `~/.gemini/config/hooks.json`            | OTLP/HTTP JSON logs                        |
@@ -43,11 +43,17 @@ Every tool sends OpenTelemetry over plain HTTP (OTLP/HTTP, protobuf or JSON) to 
 
 Notes:
 
-- **Shell profile.** `install` adds a marked block to your shell profile exporting `FLOWSTATE_OTLP_ENDPOINT`, `FLOWSTATE_OTLP_KEY`, `OTEL_EXPORTER_OTLP_HEADERS` (needed by Copilot Chat, Gemini CLI and Qwen Code, which read headers from the environment) and, when `FLOWSTATE_TEAM_ID` / `FLOWSTATE_EMAIL` are set, `OTEL_RESOURCE_ATTRIBUTES`. It never sets `service.name`: each tool reports its own. `OTEL_EXPORTER_OTLP_ENDPOINT` is never exported globally; Copilot CLI and OpenCode get it through small wrapper functions so other OpenTelemetry SDKs started from your shell keep their own endpoint. Those SDKs do still inherit `OTEL_EXPORTER_OTLP_HEADERS`, so a local app exporting to its own collector will send it your Flowstate key; set `OTEL_EXPORTER_OTLP_HEADERS` explicitly for such apps.
-- **Hook tools (Cursor, Windsurf, Antigravity)** send one log record per hook with ids, the model, line counts, the file extension and prompt length only. Prompt text, file contents, paths, commands and transcripts are never sent. Editors opened from the Dock read the endpoint and key from `~/.config/flowstate-telemetry/env` (mode 0600). The scripts need `jq` and `curl`.
-- **Apps opened from the Dock (macOS)** do not read your shell profile. VS Code 1.138+ takes the key from the `github.copilot.chat.otel.headers` setting; for older builds use `install --gui-env` (below) or start VS Code with `code` from a terminal.
+- **Where the key goes.** The key is scoped to each tool and is never exported as `OTEL_EXPORTER_OTLP_HEADERS`: every OpenTelemetry SDK reads that variable, so any other instrumented program would send your Flowstate key to its own (third-party) collector, and it would clobber a value you set yourself. Each tool gets the key from its own settings where it has one (Claude Code `env` block, Codex `[otel]` headers, Gemini CLI `telemetry.otlpHeaders` on 0.65+, Copilot Chat `github.copilot.chat.otel.headers`). Tools that only read the environment (Copilot CLI, OpenCode, Qwen Code, Gemini CLI before 0.65) get small wrapper functions in your shell profile (`copilot`, `opencode`, `qwen`, `gemini`) that set the `OTEL_*` variables for that one command; the `gemini` and `qwen` wrappers also set delta metrics temporality. Only commands started from a shell that reads the profile are covered. Variables a tool passes on to programs it runs itself are outside this tool's control.
+- **Shell profile.** `install` adds a marked block exporting `FLOWSTATE_OTLP_ENDPOINT`, `FLOWSTATE_OTLP_KEY` (read by the wrappers and hook scripts; no OpenTelemetry SDK reads them) and, when `FLOWSTATE_TEAM_ID` / `FLOWSTATE_EMAIL` are set, `OTEL_RESOURCE_ATTRIBUTES`. It never sets `service.name`: each tool reports its own. No generic `OTEL_EXPORTER_OTLP_*` variable is exported.
+- **Copilot Chat** takes the key only from the `github.copilot.chat.otel.headers` setting. VS Code builds without that setting (before 1.138) cannot authenticate: update VS Code. **Settings Sync** would upload that setting, and so your key, to your sync account and every synced machine; `install` adds it to `settingsSync.ignoredSettings` and `verify` warns when it is missing. If Settings Sync was on before, rotate the key.
+- **Hook tools (Cursor, Windsurf, Antigravity)** send one log record per hook with ids, the model, line counts, the file extension (`code.file_extension`, lower case without the leading dot, e.g. `tsx`) and prompt length only. Prompt text, file contents, paths, commands and transcripts are never sent. Editors opened from the Dock read the endpoint and key from `~/.config/flowstate-telemetry/env` (mode 0600). The key header is passed to `curl` on stdin, never on its command line (visible in `ps`). The scripts need `jq` and `curl`.
 - **OpenCode**: upstream marks `experimental.openTelemetry` as deprecated.
-- **Prompt capture** is off unless you pass `--prompts` (Gemini CLI and Qwen Code default to logging prompts, so `logPrompts` is written as `false` explicitly).
+- **Prompt and response logging stays off.** Flowstate drops content anyway, so it should not leave the machine. Gemini CLI and Qwen Code default to logging prompts, so `logPrompts` is written as `false` explicitly. `--prompts` exists but is not recommended, and `verify` warns when a tool logs prompts.
+- **Codex** exports OTLP metrics only while `[analytics] enabled` is `true` (the default); `verify` warns when it is `false`.
+
+### Upgrading from otel.flowstate.inc
+
+Earlier releases used the retired gRPC receiver `https://otel.flowstate.inc` and exported it as `FLOWSTATE_OTLP_ENDPOINT` from the shell profile (plus a global `OTEL_EXPORTER_OTLP_HEADERS`). Any `otel.flowstate.inc` endpoint, with or without a port or path, is treated as unset, so re-running `install --all` configures every tool for `https://otel.flowstate.host` and rewrites the shell block, the hook env file and an existing `--gui-env` LaunchAgent. The hook scripts ignore the old endpoint too. `verify` fails while the old endpoint remains anywhere (environment, shell profile, tool configs, hook env file, LaunchAgent, machine-wide files left by older MDM templates) and warns about a leftover global `OTEL_EXPORTER_OTLP_HEADERS`. Open a new terminal after installing.
 
 ## Install
 
@@ -90,12 +96,6 @@ flowstate-telemetry verify
 flowstate-telemetry install --all
 ```
 
-### With prompt capture
-
-```bash
-flowstate-telemetry install --all --prompts
-```
-
 ### Configure a single tool
 
 ```bash
@@ -108,13 +108,15 @@ flowstate-telemetry install --tool claude-code
 flowstate-telemetry install --all --gui-env
 ```
 
-Runs `launchctl setenv` for `FLOWSTATE_OTLP_ENDPOINT`, `FLOWSTATE_OTLP_KEY` and `OTEL_EXPORTER_OTLP_HEADERS`, and installs `~/Library/LaunchAgents/inc.flowstate.telemetry.env.plist` to repeat it at login. Every GUI app you run can then see these variables, so it is opt-in. Restart running apps afterwards. `remove --all` undoes it.
+Runs `launchctl setenv` for `FLOWSTATE_OTLP_ENDPOINT` and `FLOWSTATE_OTLP_KEY`, and installs `~/Library/LaunchAgents/inc.flowstate.telemetry.env.plist` to repeat it at login. It is rarely needed (the hook scripts read `~/.config/flowstate-telemetry/env`), and every GUI app you run can then see these variables, so it is opt-in. It never publishes `OTEL_EXPORTER_OTLP_HEADERS`, and unsets the copy earlier releases published. Restart running apps afterwards. `remove --all` undoes it.
 
 ### Preview changes (dry run)
 
 ```bash
 flowstate-telemetry install --all --dry-run
 ```
+
+The key is shown as `<redacted>`.
 
 ### Check status
 
@@ -138,6 +140,9 @@ flowstate-telemetry generate-mdm --format intune     # Microsoft Intune
 flowstate-telemetry generate-mdm --format ansible    # Ansible
 flowstate-telemetry generate-mdm --format puppet     # Puppet
 ```
+
+- **One key per artefact.** The artefact embeds the key you generate it with, so every user it is deployed to is attributed to that key's owner. Per-user attribution needs per-user keys: substitute a per-user key at deployment (Jamf: script parameter 4 overrides the embedded key; Ansible: `flowstate_key` per host; Puppet: `$key` from Hiera; Intune: `$Key`).
+- **No machine-wide key.** The templates write the key only into each user's tool settings and per-user files or variables (Jamf: `~/.config/flowstate-telemetry/env`, mode 0600, owned by the user; Ansible/Puppet: `~/.bashrc`; Intune: user-scope `FLOWSTATE_*` variables, so run it as the logged-on user). They no longer write `/etc/flowstate-telemetry.env`, `/etc/profile.d/flowstate-telemetry.sh` or `/etc/environment` entries, never set `OTEL_EXPORTER_OTLP_HEADERS` machine-, session- or shell-wide, and remove what earlier versions wrote there (Jamf also removes the old LaunchAgent and unsets the variables in the logged-in user's session). Gemini CLI gets the key from a `gemini` wrapper function in `~/.bashrc` (Ansible, Puppet).
 
 ## Environment Variables
 

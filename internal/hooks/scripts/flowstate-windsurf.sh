@@ -3,7 +3,7 @@
 #
 # Usage (from ~/.codeium/windsurf/hooks.json): flowstate.sh <hookName>, hook
 # JSON on stdin. Posts one OTLP/HTTP JSON log record to <endpoint>/v1/logs
-# carrying ids, the model, line counts, file extensions and prompt length. It
+# carrying ids, the model, line counts, file extensions (no leading dot) and prompt length. It
 # never sends prompt text, responses, file contents, paths, commands,
 # transcripts or the raw payload. It always exits 0 and never delays Cascade.
 
@@ -23,7 +23,13 @@ fi
 # the env file written by `flowstate-telemetry install` (parsed, not sourced).
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/flowstate-telemetry/env"
 conf() { [ -r "$CONF" ] && sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n 1; return 0; }
-ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-$(conf FLOWSTATE_OTLP_ENDPOINT)}"
+# The retired otel.flowstate.inc receiver (exported by older releases) counts
+# as unset.
+legacy() { case "$1" in *otel.flowstate.inc|*otel.flowstate.inc[:/]*) return 0 ;; esac; return 1; }
+ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-}"
+legacy "$ENDPOINT" && ENDPOINT=""
+[ -n "$ENDPOINT" ] || ENDPOINT="$(conf FLOWSTATE_OTLP_ENDPOINT)"
+legacy "$ENDPOINT" && ENDPOINT=""
 ENDPOINT="${ENDPOINT:-https://otel.flowstate.host}"
 ENDPOINT="${ENDPOINT%/}"
 case "$ENDPOINT" in */v1/logs) ;; *) ENDPOINT="$ENDPOINT/v1/logs" ;; esac
@@ -70,9 +76,16 @@ PAYLOAD=$(printf '%s' "$INPUT" | jq -c --arg tool "$TOOL" --arg hook "$HOOK" '
     }]}' 2>/dev/null) || exit 0
 [ -n "$PAYLOAD" ] || exit 0
 
-curl -sf --max-time 3 -X POST "$ENDPOINT" \
-  -H "Content-Type: application/json" \
-  ${KEY:+-H "x-flowstate-key: $KEY"} \
-  -d "$PAYLOAD" >/dev/null 2>&1 &
+# The key header goes to curl on stdin (-H @-), never on its command line,
+# which any local user can read with ps.
+send() {
+  if [ -n "$KEY" ]; then
+    printf 'x-flowstate-key: %s\n' "$KEY" |
+      curl -sf --max-time 3 -X POST "$ENDPOINT" -H "Content-Type: application/json" -H @- -d "$PAYLOAD"
+  else
+    curl -sf --max-time 3 -X POST "$ENDPOINT" -H "Content-Type: application/json" -d "$PAYLOAD" </dev/null
+  fi
+}
+send >/dev/null 2>&1 &
 
 exit 0

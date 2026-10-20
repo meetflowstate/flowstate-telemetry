@@ -9,26 +9,79 @@ import (
 	"strings"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
-	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
 // CopilotChat configures telemetry for GitHub Copilot Chat in VS Code.
 //
 // exporterType "otlp-http" makes the extension append /v1/{traces,logs,
-// metrics} to otlpEndpoint. The key is written to the
-// `github.copilot.chat.otel.headers` setting (VS Code 1.138+) and is also
-// exported as OTEL_EXPORTER_OTLP_HEADERS by the shell profile block, which
-// older builds need. VS Code started from the Dock never reads the shell
-// profile; `install --gui-env` publishes the variables to launchd for that.
+// metrics} to otlpEndpoint. The key goes only in the
+// `github.copilot.chat.otel.headers` setting (VS Code 1.138+): it is never
+// exported as OTEL_EXPORTER_OTLP_HEADERS, which every OTel SDK would send to
+// its own collector, so older builds without the setting cannot authenticate.
+//
+// VS Code Settings Sync would upload the headers setting (and so the key) to
+// the user's Microsoft/GitHub account and every synced machine, so Install
+// also lists it in `settingsSync.ignoredSettings`.
 type CopilotChat struct{}
+
+const (
+	copilotChatHeadersKey = "github.copilot.chat.otel.headers"
+	settingsSyncIgnored   = "settingsSync.ignoredSettings"
+)
 
 // copilotChatKeys are the settings Flowstate owns.
 var copilotChatKeys = []string{
 	"github.copilot.chat.otel.enabled",
 	"github.copilot.chat.otel.exporterType",
 	"github.copilot.chat.otel.otlpEndpoint",
-	"github.copilot.chat.otel.headers",
+	copilotChatHeadersKey,
 	"github.copilot.chat.otel.captureContent",
+}
+
+// setSyncIgnored adds (or removes) the headers setting in
+// settingsSync.ignoredSettings, keeping the user's other entries.
+func setSyncIgnored(settings map[string]interface{}, ignore bool) {
+	list, _ := settings[settingsSyncIgnored].([]interface{})
+	var kept []interface{}
+	for _, v := range list {
+		if v != copilotChatHeadersKey {
+			kept = append(kept, v)
+		}
+	}
+	if ignore {
+		kept = append(kept, copilotChatHeadersKey)
+	}
+	if len(kept) == 0 {
+		delete(settings, settingsSyncIgnored)
+	} else {
+		settings[settingsSyncIgnored] = kept
+	}
+}
+
+// syncIgnored reports whether the headers setting is excluded from Settings Sync.
+func syncIgnored(settings map[string]interface{}) bool {
+	list, _ := settings[settingsSyncIgnored].([]interface{})
+	for _, v := range list {
+		if v == copilotChatHeadersKey {
+			return true
+		}
+	}
+	return false
+}
+
+// copilotChatKeyNotes is printed after install and by verify.
+var copilotChatKeyNotes = []string{
+	"the key is stored in VS Code settings.json (" + copilotChatHeadersKey + "); install lists it in " + settingsSyncIgnored +
+		" so Settings Sync does not upload it. If Settings Sync was on before, the key may already be in your sync data: rotate it",
+	"VS Code builds without the " + copilotChatHeadersKey + " setting (before 1.138) cannot authenticate: update VS Code",
+}
+
+// InstallNotes implements Noter.
+func (c *CopilotChat) InstallNotes(cfg config.Config) []string {
+	if cfg.Key == "" {
+		return nil
+	}
+	return copilotChatKeyNotes
 }
 
 func (c *CopilotChat) Name() string { return "copilot-chat" }
@@ -94,10 +147,11 @@ func (c *CopilotChat) Install(cfg config.Config) error {
 	settings["github.copilot.chat.otel.otlpEndpoint"] = cfg.BaseEndpoint()
 	settings["github.copilot.chat.otel.captureContent"] = cfg.Prompts
 	if cfg.Key != "" {
-		settings["github.copilot.chat.otel.headers"] = map[string]interface{}{config.AuthHeader: cfg.Key}
+		settings[copilotChatHeadersKey] = map[string]interface{}{config.AuthHeader: cfg.Key}
 	} else {
-		delete(settings, "github.copilot.chat.otel.headers")
+		delete(settings, copilotChatHeadersKey)
 	}
+	setSyncIgnored(settings, true)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")
@@ -117,6 +171,7 @@ func (c *CopilotChat) Remove() error {
 	for _, k := range copilotChatKeys {
 		delete(settings, k)
 	}
+	setSyncIgnored(settings, false)
 
 	return c.writeSettings(settings)
 }
@@ -167,6 +222,15 @@ func (c *CopilotChat) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: "otlpEndpoint not set"}
 	}
 
+	if r := legacyEndpoint("otlpEndpoint", endpoint); r != nil {
+		return *r
+	}
+	headers, _ := settings[copilotChatHeadersKey].(map[string]interface{})
+	if key, _ := headers[config.AuthHeader].(string); key == "" {
+		return VerifyResult{OK: false, Message: "no x-flowstate-key in " + copilotChatHeadersKey + " (the key is never read from the environment)",
+			Notes: copilotChatKeyNotes[1:]}
+	}
+
 	var warnings []string
 	if endpoint != cfg.BaseEndpoint() {
 		warnings = append(warnings, fmt.Sprintf("otlpEndpoint %s differs from %s", endpoint, cfg.BaseEndpoint()))
@@ -176,18 +240,13 @@ func (c *CopilotChat) Verify(cfg config.Config) VerifyResult {
 			warnings = append(warnings, fmt.Sprintf("%s=%s overrides otlpEndpoint", env, v))
 		}
 	}
-	headers, _ := settings["github.copilot.chat.otel.headers"].(map[string]interface{})
-	if _, ok := headers[config.AuthHeader]; !ok && !strings.Contains(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"), config.AuthHeader+"=") {
-		warnings = append(warnings, "no x-flowstate-key header in settings or OTEL_EXPORTER_OTLP_HEADERS")
+	if !syncIgnored(settings) {
+		warnings = append(warnings, "VS Code Settings Sync uploads "+copilotChatHeadersKey+" (your key) unless it is in "+settingsSyncIgnored+": re-run install")
 	}
-	if captureContent, ok := settings["github.copilot.chat.otel.captureContent"].(bool); !ok || !captureContent {
-		warnings = append(warnings, "captureContent not enabled (re-run with --prompts)")
+	if captureContent, _ := settings["github.copilot.chat.otel.captureContent"].(bool); captureContent {
+		warnings = append(warnings, promptsOnWarning("captureContent"))
 	}
 
-	result := VerifyResult{OK: true, Message: fmt.Sprintf("settings.json present · OTLP/HTTP endpoint=%s", endpoint), Warning: joinWarnings(warnings)}
-	if shell.GUIEnvSupported() && !shell.GUIEnvInstalled() {
-		result.Notes = append(result.Notes,
-			"VS Code opened from the Dock does not read "+shell.ProfilePath()+"; builds before 1.138 ignore the headers setting, so run `install --gui-env` (launchctl setenv) or start VS Code with `code` from a terminal")
-	}
-	return result
+	return VerifyResult{OK: true, Message: fmt.Sprintf("settings.json present · OTLP/HTTP endpoint=%s", endpoint),
+		Warning: joinWarnings(warnings), Notes: copilotChatKeyNotes}
 }

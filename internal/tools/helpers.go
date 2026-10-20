@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/meetflowstate/flowstate-telemetry/internal/config"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
@@ -134,4 +135,20 @@ func joinWarnings(w []string) string {
 // shellProfileName is the shell profile path, for messages.
 func shellProfileName() string {
 	return shell.ProfilePath()
+}
+
+// legacyEndpoint returns a failing VerifyResult when endpoint is the retired
+// otel.flowstate.inc receiver, or nil.
+func legacyEndpoint(where, endpoint string) *VerifyResult {
+	if !config.IsLegacyEndpoint(endpoint) {
+		return nil
+	}
+	return &VerifyResult{OK: false, Message: fmt.Sprintf("%s is the retired receiver %s: re-run `flowstate-telemetry install`", where, endpoint)}
+}
+
+// promptsOnWarning is the verify warning for a tool that logs prompt or
+// response content. Flowstate drops content anyway; it should not leave
+// the machine.
+func promptsOnWarning(setting string) string {
+	return setting + " is on: prompt content leaves the machine (Flowstate drops it); re-run install without --prompts"
 }

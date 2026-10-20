@@ -32,6 +32,11 @@ type Tool interface {
 	Verify(cfg config.Config) VerifyResult
 }
 
+// Noter is implemented by tools with advice to print after install.
+type Noter interface {
+	InstallNotes(cfg config.Config) []string
+}
+
 var registry []Tool
 
 // Register adds a tool to the global registry.

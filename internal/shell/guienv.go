@@ -15,9 +15,13 @@ import (
 
 // GUI apps on macOS (VS Code, Cursor, Windsurf launched from the Dock or
 // Spotlight) do not read the shell profile. `--gui-env` publishes the
-// Flowstate variables to the user's launchd session with `launchctl setenv`
+// FLOWSTATE_* variables to the user's launchd session with `launchctl setenv`
 // and drops a LaunchAgent that repeats it at every login. It is opt-in:
 // launchd variables are visible to every GUI app the user runs.
+//
+// OTEL_EXPORTER_OTLP_HEADERS is never published (earlier releases did): every
+// OTel SDK in every GUI app would send the Flowstate key to its own collector.
+// Installing unsets it, and a refreshed LaunchAgent no longer sets it.
 
 const guiEnvLabel = "inc.flowstate.telemetry.env"
 
@@ -43,10 +47,7 @@ func GUIEnvAgentPath() string {
 func guiEnvVars(cfg config.Config) [][2]string {
 	vars := [][2]string{{"FLOWSTATE_OTLP_ENDPOINT", cfg.BaseEndpoint()}}
 	if cfg.Key != "" {
-		vars = append(vars,
-			[2]string{"FLOWSTATE_OTLP_KEY", cfg.Key},
-			[2]string{"OTEL_EXPORTER_OTLP_HEADERS", cfg.HeadersEnv()},
-		)
+		vars = append(vars, [2]string{"FLOWSTATE_OTLP_KEY", cfg.Key})
 	}
 	return vars
 }
@@ -69,6 +70,7 @@ func InstallGUIEnv(cfg config.Config, dryRun bool) error {
 			shown = strings.ReplaceAll(plist, cfg.Key, "<redacted>")
 		}
 		fmt.Printf("[dry-run] Would write %s:\n%s\n", GUIEnvAgentPath(), shown)
+		fmt.Println("[dry-run] Would run: launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS")
 		for _, kv := range vars {
 			fmt.Printf("[dry-run] Would run: launchctl setenv %s <value>\n", kv[0])
 		}
@@ -80,6 +82,8 @@ func InstallGUIEnv(cfg config.Config, dryRun bool) error {
 	if err := os.WriteFile(GUIEnvAgentPath(), []byte(plist), 0600); err != nil {
 		return fmt.Errorf("writing LaunchAgent: %w", err)
 	}
+	// Set by earlier releases; harmless when absent.
+	_ = runCommand("launchctl", "unsetenv", "OTEL_EXPORTER_OTLP_HEADERS")
 	for _, kv := range vars {
 		if err := runCommand("launchctl", "setenv", kv[0], kv[1]); err != nil {
 			return err
@@ -107,6 +111,12 @@ func RemoveGUIEnv() error {
 func GUIEnvInstalled() bool {
 	_, err := os.Stat(GUIEnvAgentPath())
 	return err == nil
+}
+
+// GUIEnvAgentText returns the LaunchAgent plist ("" when absent), for verify.
+func GUIEnvAgentText() string {
+	data, _ := os.ReadFile(GUIEnvAgentPath())
+	return string(data)
 }
 
 func guiEnvPlist(vars [][2]string) string {

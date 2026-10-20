@@ -37,6 +37,11 @@ func runGenerateMDM(cmd *cobra.Command, args []string) error {
 	if cfg.Key == "" {
 		fmt.Fprintln(os.Stderr, "Warning: no API key set. The generated artefact will have an empty key placeholder.")
 	}
+	fmt.Fprintln(os.Stderr, "Note: the artefact embeds ONE key. Every user it is deployed to is attributed to that key's owner;")
+	fmt.Fprintln(os.Stderr, "      per-user attribution needs a per-user key (substitute it per device/user in your MDM).")
+	if cfg.IgnoredLegacyEndpoint != "" {
+		fmt.Fprintf(os.Stderr, "Note: ignoring the retired endpoint %s; using %s\n", cfg.IgnoredLegacyEndpoint, cfg.BaseEndpoint())
+	}
 
 	switch flagMDMFormat {
 	case "jamf":

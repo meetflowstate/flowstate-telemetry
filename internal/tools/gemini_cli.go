@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
 // GeminiCLI configures telemetry for Google's Gemini CLI.
@@ -18,9 +19,25 @@ import (
 // With otlpProtocol "http" Gemini appends /v1/{logs,metrics,traces} to
 // otlpEndpoint and sends OTLP/HTTP JSON. The `telemetry.otlpHeaders` object
 // exists from v0.65.0; older releases warn about it on every start, so it is
-// only written when the installed version supports it. Every version also
-// reads OTEL_EXPORTER_OTLP_HEADERS from the shell profile block.
+// only written when the installed version supports it. Otherwise the key goes
+// into a `gemini` wrapper function in the shell profile, never into a global
+// OTEL_EXPORTER_OTLP_HEADERS. The wrapper always sets delta temporality,
+// which the OTel JS metrics exporter reads from the environment only.
 type GeminiCLI struct{}
+
+// geminiStyleBlock renders the wrapper for Gemini CLI or Qwen Code. withKey
+// adds OTEL_EXPORTER_OTLP_HEADERS for builds that cannot take the key from
+// settings.json; the key itself comes from FLOWSTATE_OTLP_KEY at run time.
+func geminiStyleBlock(command, product string, withKey bool) []string {
+	assignments := []string{"OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta"}
+	if withKey {
+		assignments = append(assignments, fmt.Sprintf(`OTEL_EXPORTER_OTLP_HEADERS="%s=${FLOWSTATE_OTLP_KEY:-}"`, config.AuthHeader))
+	}
+	return []string{
+		"# Scopes OpenTelemetry settings to " + product + " only.",
+		shell.WrapperFunction(command, assignments),
+	}
+}
 
 // geminiVersion reports the installed Gemini CLI version ("" if unknown).
 // Swapped out by tests.
@@ -106,19 +123,24 @@ func (g *GeminiCLI) Install(cfg config.Config) error {
 		"otlpProtocol": "http",
 		"logPrompts":   cfg.Prompts,
 	}
-	if cfg.Key != "" && geminiSupportsHeaders(geminiVersion()) {
+	inSettings := cfg.Key != "" && geminiSupportsHeaders(geminiVersion())
+	if inSettings {
 		telemetry["otlpHeaders"] = map[string]interface{}{config.AuthHeader: cfg.Key}
 	}
 
 	settings["telemetry"] = telemetry
+	block := geminiStyleBlock("gemini", "Gemini CLI", !inSettings)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")
 		fmt.Printf("[dry-run] Would write to %s:\n%s\n", g.settingsPath(), redactKey(string(data), cfg.Key))
-		return nil
+		return shell.WriteToolBlock(g.Name(), block, true)
 	}
 
-	return g.writeSettings(settings)
+	if err := g.writeSettings(settings); err != nil {
+		return err
+	}
+	return shell.WriteToolBlock(g.Name(), block, false)
 }
 
 func (g *GeminiCLI) Remove() error {
@@ -129,7 +151,10 @@ func (g *GeminiCLI) Remove() error {
 
 	delete(settings, "telemetry")
 
-	return g.writeSettings(settings)
+	if err := g.writeSettings(settings); err != nil {
+		return err
+	}
+	return shell.RemoveToolBlock(g.Name())
 }
 
 func (g *GeminiCLI) Status() ToolStatus {
@@ -180,12 +205,13 @@ func (g *GeminiCLI) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: "telemetry not enabled"}
 	}
 
-	return verifyGeminiStyle(telemetry, cfg, "GEMINI_TELEMETRY_OTLP_ENDPOINT", true)
+	return verifyGeminiStyle(telemetry, cfg, "GEMINI_TELEMETRY_OTLP_ENDPOINT", g.Name(), "gemini", true)
 }
 
-// verifyGeminiStyle checks a Gemini/Qwen `telemetry` block. headersSetting
-// says whether the tool can take otlpHeaders from settings.json.
-func verifyGeminiStyle(telemetry map[string]interface{}, cfg config.Config, endpointEnv string, headersSetting bool) VerifyResult {
+// verifyGeminiStyle checks a Gemini/Qwen `telemetry` block and the tool's
+// wrapper function. headersSetting says whether the tool can take
+// otlpHeaders from settings.json.
+func verifyGeminiStyle(telemetry map[string]interface{}, cfg config.Config, endpointEnv, tool, command string, headersSetting bool) VerifyResult {
 	if p, _ := telemetry["otlpProtocol"].(string); p != "http" {
 		return VerifyResult{OK: false, Message: fmt.Sprintf("otlpProtocol=%q, want \"http\" (gRPC is not accepted)", p)}
 	}
@@ -193,8 +219,19 @@ func verifyGeminiStyle(telemetry map[string]interface{}, cfg config.Config, endp
 	if endpoint == "" {
 		return VerifyResult{OK: false, Message: "otlpEndpoint not set"}
 	}
+	if r := legacyEndpoint("otlpEndpoint", endpoint); r != nil {
+		return *r
+	}
 	if _, ok := telemetry["outfile"]; ok {
 		return VerifyResult{OK: false, Message: "telemetry.outfile is set and overrides OTLP export"}
+	}
+
+	headers, _ := telemetry["otlpHeaders"].(map[string]interface{})
+	_, inSettings := headers[config.AuthHeader]
+	block := shell.ToolBlock(tool)
+	inWrapper := strings.Contains(block, "OTEL_EXPORTER_OTLP_HEADERS=")
+	if !inSettings && !inWrapper {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("no x-flowstate-key: neither telemetry.otlpHeaders nor a `%s` wrapper in %s (re-run install)", command, shellProfileName())}
 	}
 
 	var warnings []string
@@ -206,23 +243,22 @@ func verifyGeminiStyle(telemetry map[string]interface{}, cfg config.Config, endp
 			warnings = append(warnings, fmt.Sprintf("%s=%s overrides otlpEndpoint", env, v))
 		}
 	}
-	headers, _ := telemetry["otlpHeaders"].(map[string]interface{})
-	_, inSettings := headers[config.AuthHeader]
-	inEnv := strings.Contains(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"), config.AuthHeader+"=")
-	if !inSettings && !inEnv {
-		warnings = append(warnings, "no x-flowstate-key header: open a new shell so OTEL_EXPORTER_OTLP_HEADERS from "+shellProfileName()+" is loaded")
+	if !strings.Contains(block, "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta") {
+		warnings = append(warnings, fmt.Sprintf("metrics temporality is not delta: the `%s` wrapper is missing (re-run install)", command))
 	}
-	if p, _ := telemetry["logPrompts"].(bool); !p {
-		warnings = append(warnings, "logPrompts not enabled (re-run with --prompts)")
+	if p, _ := telemetry["logPrompts"].(bool); p {
+		warnings = append(warnings, promptsOnWarning("logPrompts"))
 	}
 
 	result := VerifyResult{OK: true, Message: fmt.Sprintf("settings.json present · OTLP/HTTP endpoint=%s", endpoint), Warning: joinWarnings(warnings)}
 	if !inSettings {
+		wrapperNote := fmt.Sprintf("the key comes from the `%s` wrapper in %s: only `%s` started from a shell that reads it is covered", command, shellProfileName(), command)
 		if headersSetting {
-			result.Notes = append(result.Notes, "auth header comes from OTEL_EXPORTER_OTLP_HEADERS (telemetry.otlpHeaders needs Gemini CLI 0.65+; re-run install after upgrading)")
+			wrapperNote += " (telemetry.otlpHeaders needs Gemini CLI 0.65+; re-run install after upgrading)"
 		} else {
-			result.Notes = append(result.Notes, "auth header comes from OTEL_EXPORTER_OTLP_HEADERS (settings.json has no header option)")
+			wrapperNote += " (settings.json has no header option)"
 		}
+		result.Notes = append(result.Notes, wrapperNote)
 	}
 	return result
 }

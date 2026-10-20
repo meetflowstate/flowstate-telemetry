@@ -95,7 +95,7 @@ func (c *ClaudeCode) Install(cfg config.Config) error {
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")
-		fmt.Printf("[dry-run] Would write to %s:\n%s\n", c.settingsPath(), string(data))
+		fmt.Printf("[dry-run] Would write to %s:\n%s\n", c.settingsPath(), redactKey(string(data), cfg.Key))
 		return nil
 	}
 
@@ -195,6 +195,9 @@ func (c *ClaudeCode) Verify(cfg config.Config) VerifyResult {
 	if endpoint == "" {
 		return VerifyResult{OK: false, Message: "OTEL_EXPORTER_OTLP_ENDPOINT not set"}
 	}
+	if r := legacyEndpoint("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint); r != nil {
+		return *r
+	}
 	if h, _ := envBlock["OTEL_EXPORTER_OTLP_HEADERS"].(string); !strings.Contains(h, config.AuthHeader+"=") || strings.HasSuffix(h, "=") {
 		return VerifyResult{OK: false, Message: "OTEL_EXPORTER_OTLP_HEADERS has no x-flowstate-key"}
 	}
@@ -207,8 +210,8 @@ func (c *ClaudeCode) Verify(cfg config.Config) VerifyResult {
 	if t, _ := envBlock["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"].(string); t != "delta" {
 		warnings = append(warnings, "metrics temporality is not delta (re-run install)")
 	}
-	if _, ok := envBlock["OTEL_LOG_USER_PROMPTS"]; !ok {
-		warnings = append(warnings, "prompt capture not enabled (re-run with --prompts)")
+	if p, _ := envBlock["OTEL_LOG_USER_PROMPTS"].(string); p != "" && p != "0" && p != "false" {
+		warnings = append(warnings, promptsOnWarning("OTEL_LOG_USER_PROMPTS"))
 	}
 	result.Warning = strings.Join(warnings, "; ")
 

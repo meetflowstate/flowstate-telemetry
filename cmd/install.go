@@ -120,10 +120,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Hook scripts in editors read this file. A hook tool's Install rewrites
-	// it; also refresh one left by an earlier install (it may name the
-	// retired endpoint) when no hook tool was installed this time.
-	if _, err := os.Stat(hooks.EnvFilePath()); err == nil {
+	// Hook scripts in editors and the shell profile block read the key from
+	// this file (mode 0600), so the key is never written into the profile.
+	// Without a key this refreshes an existing file (it may name the retired
+	// endpoint) and keeps the key already in it.
+	_, statErr := os.Stat(hooks.EnvFilePath())
+	if cfg.Key != "" || statErr == nil {
 		if cfg.DryRun {
 			fmt.Printf("  [dry-run] Would rewrite %s\n", hooks.EnvFilePath())
 		} else if err := hooks.WriteEnvFile(cfg); err != nil {

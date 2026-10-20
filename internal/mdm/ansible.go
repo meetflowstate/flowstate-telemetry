@@ -6,6 +6,7 @@ import (
 	"text/template"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
 const ansibleTemplate = `---
@@ -19,7 +20,10 @@ const ansibleTemplate = `---
 #
 # The key is never exported as OTEL_EXPORTER_OTLP_HEADERS (every OpenTelemetry
 # SDK would send it to its own collector): it goes into each tool's own
-# settings, and Gemini CLI gets it from a "gemini" wrapper function.
+# settings and ~/.config/flowstate-telemetry/env (mode 0600). The shell
+# profile (~/.bashrc, and ~/.zshrc on macOS) reads it from there at start-up
+# and Gemini CLI gets it from a "gemini" wrapper function; no profile stores
+# the key. Settings files that hold the key are created 0600.
 
 - name: Configure Flowstate AI Telemetry
   hosts: developers
@@ -47,6 +51,21 @@ const ansibleTemplate = `---
         regexp: "^OTEL_RESOURCE_ATTRIBUTES=service.name=flowstate-telemetry$"
         state: absent
 
+    - name: Ensure the Flowstate config directory exists (this user only)
+      file:
+        path: "{{ "{{ ansible_env.HOME }}" }}/.config/flowstate-telemetry"
+        state: directory
+        mode: "0700"
+
+    - name: Write the endpoint and key for hook scripts and shells (mode 0600)
+      copy:
+        dest: "{{ "{{ ansible_env.HOME }}" }}/.config/flowstate-telemetry/env"
+        content: |
+          FLOWSTATE_OTLP_ENDPOINT={{ "{{ flowstate_endpoint }}" }}
+          FLOWSTATE_OTLP_KEY={{ "{{ flowstate_key }}" }}
+        mode: "0600"
+      no_log: true
+
     - name: Ensure Claude Code config directory exists
       file:
         path: "{{ "{{ ansible_env.HOME }}" }}/.claude"
@@ -70,21 +89,15 @@ const ansibleTemplate = `---
               "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
             }
           }
-        mode: "0644"
+        mode: "0600"
         force: false
+      no_log: true
       when: ansible_env.HOME is defined
 
     - name: Check if VS Code settings directory exists
       stat:
         path: "{{ "{{ ansible_env.HOME }}" }}/.config/Code/User"
       register: vscode_dir
-
-    - name: Ensure VS Code settings directory exists
-      file:
-        path: "{{ "{{ ansible_env.HOME }}" }}/.config/Code/User"
-        state: directory
-        mode: "0755"
-      when: vscode_dir.stat.exists
 
     - name: Configure VS Code Copilot Chat telemetry
       copy:
@@ -97,16 +110,24 @@ const ansibleTemplate = `---
             "github.copilot.chat.otel.headers": { "x-flowstate-key": "{{ "{{ flowstate_key }}" }}" },
             "settingsSync.ignoredSettings": ["github.copilot.chat.otel.headers"]
           }
-        mode: "0644"
+        mode: "0600"
         force: false
+      no_log: true
       when: vscode_dir.stat.exists
+
+    # Runs on the target host (a pipe lookup would run on the controller).
+    - name: Check for Gemini CLI on the target
+      shell: command -v gemini >/dev/null 2>&1 || test -d "$HOME/.gemini"
+      register: gemini_check
+      changed_when: false
+      failed_when: false
 
     - name: Ensure Gemini config directory exists
       file:
         path: "{{ "{{ ansible_env.HOME }}" }}/.gemini"
         state: directory
         mode: "0755"
-      when: lookup('pipe', 'which gemini', errors='ignore') != ''
+      when: gemini_check.rc == 0
 
     - name: Configure Gemini CLI telemetry
       copy:
@@ -123,19 +144,19 @@ const ansibleTemplate = `---
           }
         mode: "0644"
         force: false
-      when: lookup('pipe', 'which gemini', errors='ignore') != ''
+      when: gemini_check.rc == 0
 
-    - name: Add shell profile environment variables
+    # ~/.bashrc everywhere, and ~/.zshrc on macOS (zsh is the default shell).
+    # The block holds no key: it reads FLOWSTATE_OTLP_KEY from the env file.
+    - name: Add the Flowstate shell profile block
       blockinfile:
-        path: "{{ "{{ ansible_env.HOME }}" }}/.bashrc"
+        path: "{{ "{{ ansible_env.HOME }}/{{ item }}" }}"
         marker: "# {mark} Flowstate Telemetry"
         block: |
           export FLOWSTATE_OTLP_ENDPOINT="{{ "{{ flowstate_endpoint }}" }}"
-          export FLOWSTATE_OTLP_KEY="{{ "{{ flowstate_key }}" }}"
-          # Scopes the key and delta temporality to Gemini CLI only.
-          gemini() { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" command gemini "$@"; }
-        create: true
-        mode: "0600"
+{{ range .ProfileLines }}          {{ . }}
+{{ end }}        create: true
+      loop: "{{ "{{ ['.bashrc', '.zshrc'] if ansible_system == 'Darwin' else ['.bashrc'] }}" }}"
 `
 
 // GenerateAnsible writes an Ansible playbook for Flowstate telemetry deployment.
@@ -145,8 +166,22 @@ func GenerateAnsible(w io.Writer, cfg config.Config) error {
 		return fmt.Errorf("parsing template: %w", err)
 	}
 
-	return tmpl.Execute(w, map[string]string{
-		"Endpoint": cfg.Endpoint,
-		"Key":      cfg.Key,
+	return tmpl.Execute(w, map[string]interface{}{
+		"Endpoint":     cfg.Endpoint,
+		"Key":          cfg.Key,
+		"ProfileLines": profileLines(),
 	})
+}
+
+// profileLines are the shell profile lines after FLOWSTATE_OTLP_ENDPOINT that
+// the Ansible and Puppet artefacts write to ~/.bashrc (and ~/.zshrc on
+// macOS): the key loader and the gemini wrapper. None holds the key, and
+// none contains a single quote (Puppet embeds them single-quoted).
+func profileLines() []string {
+	return []string{
+		"# FLOWSTATE_OTLP_KEY is read from ~/.config/flowstate-telemetry/env (mode 0600), not stored here.",
+		shell.KeyLoader(""),
+		"# Scopes the key and delta temporality to Gemini CLI only.",
+		`function gemini { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" command gemini "$@"; }`,
+	}
 }

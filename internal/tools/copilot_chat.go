@@ -133,7 +133,9 @@ func (c *CopilotChat) writeSettings(settings map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
-	return os.WriteFile(c.settingsPath(), data, 0644)
+	// The file holds the key (github.copilot.chat.otel.headers): a new file
+	// is private (0600); an existing file keeps its mode.
+	return os.WriteFile(c.settingsPath(), data, 0600)
 }
 
 func (c *CopilotChat) Install(cfg config.Config) error {

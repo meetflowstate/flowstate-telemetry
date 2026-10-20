@@ -108,7 +108,9 @@ func (g *GeminiCLI) writeSettings(settings map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
-	return os.WriteFile(g.settingsPath(), data, 0644)
+	// The file may hold the key (telemetry.otlpHeaders): a new file is
+	// private (0600); an existing file keeps its mode.
+	return os.WriteFile(g.settingsPath(), data, 0600)
 }
 
 func (g *GeminiCLI) Install(cfg config.Config) error {

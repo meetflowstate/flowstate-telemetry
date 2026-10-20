@@ -21,11 +21,13 @@ import (
 //
 // OTEL_EXPORTER_OTLP_HEADERS is never published (earlier releases did): every
 // OTel SDK in every GUI app would send the Flowstate key to its own collector.
-// Installing unsets it, and a refreshed LaunchAgent no longer sets it.
+// Installing and removing unset it when it carries x-flowstate-key (a value
+// the user set for their own collector is left alone), and a refreshed
+// LaunchAgent no longer sets it.
 
 const guiEnvLabel = "inc.flowstate.telemetry.env"
 
-// goos and runCommand are swapped out by tests.
+// goos, runCommand and launchctlGetenv are swapped out by tests.
 var (
 	goos       = runtime.GOOS
 	runCommand = func(name string, args ...string) error {
@@ -35,7 +37,22 @@ var (
 		}
 		return nil
 	}
+	launchctlGetenv = func(name string) string {
+		out, err := exec.Command("launchctl", "getenv", name).Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
 )
+
+// unsetLegacyHeaders unsets the launchd OTEL_EXPORTER_OTLP_HEADERS that
+// earlier releases published, only when it carries the Flowstate key.
+func unsetLegacyHeaders() {
+	if strings.Contains(launchctlGetenv("OTEL_EXPORTER_OTLP_HEADERS"), config.AuthHeader) {
+		_ = runCommand("launchctl", "unsetenv", "OTEL_EXPORTER_OTLP_HEADERS")
+	}
+}
 
 // GUIEnvAgentPath returns the LaunchAgent plist written by InstallGUIEnv.
 func GUIEnvAgentPath() string {
@@ -70,7 +87,7 @@ func InstallGUIEnv(cfg config.Config, dryRun bool) error {
 			shown = strings.ReplaceAll(plist, cfg.Key, "<redacted>")
 		}
 		fmt.Printf("[dry-run] Would write %s:\n%s\n", GUIEnvAgentPath(), shown)
-		fmt.Println("[dry-run] Would run: launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS")
+		fmt.Println("[dry-run] Would run: launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS (only if it carries " + config.AuthHeader + ")")
 		for _, kv := range vars {
 			fmt.Printf("[dry-run] Would run: launchctl setenv %s <value>\n", kv[0])
 		}
@@ -82,8 +99,8 @@ func InstallGUIEnv(cfg config.Config, dryRun bool) error {
 	if err := os.WriteFile(GUIEnvAgentPath(), []byte(plist), 0600); err != nil {
 		return fmt.Errorf("writing LaunchAgent: %w", err)
 	}
-	// Set by earlier releases; harmless when absent.
-	_ = runCommand("launchctl", "unsetenv", "OTEL_EXPORTER_OTLP_HEADERS")
+	// Set by earlier releases.
+	unsetLegacyHeaders()
 	for _, kv := range vars {
 		if err := runCommand("launchctl", "setenv", kv[0], kv[1]); err != nil {
 			return err
@@ -98,9 +115,10 @@ func RemoveGUIEnv() error {
 	if !GUIEnvSupported() || !GUIEnvInstalled() {
 		return nil
 	}
-	for _, name := range []string{"FLOWSTATE_OTLP_ENDPOINT", "FLOWSTATE_OTLP_KEY", "OTEL_EXPORTER_OTLP_HEADERS"} {
+	for _, name := range []string{"FLOWSTATE_OTLP_ENDPOINT", "FLOWSTATE_OTLP_KEY"} {
 		_ = runCommand("launchctl", "unsetenv", name)
 	}
+	unsetLegacyHeaders()
 	if err := os.Remove(GUIEnvAgentPath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing LaunchAgent: %w", err)
 	}

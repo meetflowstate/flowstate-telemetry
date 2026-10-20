@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/hooks"
 )
 
 const (
@@ -136,11 +137,19 @@ func writeBlock(start, end, block string, dryRun bool, secret string) error {
 
 	content := removeExistingBlock(string(existing), start, end)
 
-	if !strings.HasSuffix(content, "\n") && len(content) > 0 {
+	// A blank line separates the block from the user's own lines;
+	// removeExistingBlock drops it again.
+	if len(content) > 0 {
+		if !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
 		content += "\n"
 	}
-	content += "\n" + block + "\n"
+	content += block + "\n"
 
+	// The profile must stay readable by the user's shell; it holds no
+	// secret (the key is read from the 0600 env file). An existing file
+	// keeps its mode.
 	return os.WriteFile(profilePath, []byte(content), 0644)
 }
 
@@ -160,7 +169,28 @@ func removeBlock(start, end string) error {
 	return os.WriteFile(profilePath, []byte(content), 0644)
 }
 
+// KeyLoader returns the profile line that loads FLOWSTATE_OTLP_KEY from the
+// env file at envFile (mode 0600) when the shell starts, so the key is never
+// written into the profile itself, which is usually group/world-readable.
+// envFile "" means the default location resolved at run time
+// (${XDG_CONFIG_HOME:-$HOME/.config}/flowstate-telemetry/env, as the hook
+// scripts do). It is one POSIX sh line with no subprocess, so bash, zsh and
+// sh profiles can all use it; with envFile "" it has no single quotes either,
+// so MDM templates can embed it in single-quoted strings. The file is parsed,
+// never sourced.
+func KeyLoader(envFile string) string {
+	path := `"${XDG_CONFIG_HOME:-$HOME/.config}/flowstate-telemetry/env"`
+	if envFile != "" {
+		path = shQuote(envFile)
+	}
+	return "_fs_env=" + path + `; if [ -r "$_fs_env" ]; then while IFS= read -r _fs_l || [ -n "$_fs_l" ]; do case "$_fs_l" in FLOWSTATE_OTLP_KEY=*) export FLOWSTATE_OTLP_KEY="${_fs_l#FLOWSTATE_OTLP_KEY=}"; break ;; esac; done < "$_fs_env"; fi; unset _fs_env _fs_l`
+}
+
 // buildEnvBlock renders the shared profile block.
+//
+// The key itself is not in the block: it lives in the hook env file
+// (hooks.EnvFilePath, mode 0600), written by install, and the block loads it
+// from there (KeyLoader).
 //
 // Only FLOWSTATE_* variables carry the endpoint and key: no OpenTelemetry SDK
 // reads them. OTEL_EXPORTER_OTLP_HEADERS is never exported, because every
@@ -177,9 +207,8 @@ func buildEnvBlock(cfg config.Config) string {
 	lines = append(lines, markerStart)
 	lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_ENDPOINT=%q", cfg.BaseEndpoint()))
 
-	if cfg.Key != "" {
-		lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_KEY=%q", cfg.Key))
-	}
+	lines = append(lines, "# FLOWSTATE_OTLP_KEY is read from the env file (mode 0600), not stored here.")
+	lines = append(lines, KeyLoader(hooks.EnvFilePath()))
 
 	lines = append(lines, markerEnd)
 
@@ -214,13 +243,15 @@ func removeExistingBlock(content, start, end string) string {
 
 	endIdx := startIdx + rel + len(end)
 
-	// Also remove trailing newline after the block
+	// The block's own line break.
 	if endIdx < len(content) && content[endIdx] == '\n' {
 		endIdx++
 	}
 
-	// Remove leading newline before the block
-	if startIdx > 0 && content[startIdx-1] == '\n' {
+	// The blank separator line writeBlock puts before the block: drop it
+	// only when the line before the block really is empty. Dropping the
+	// previous line's own newline would join it to the line after the block.
+	if startIdx >= 1 && content[startIdx-1] == '\n' && (startIdx == 1 || content[startIdx-2] == '\n') {
 		startIdx--
 	}
 

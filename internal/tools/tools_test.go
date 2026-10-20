@@ -489,8 +489,8 @@ func TestInstall_NoGlobalOTelHeaders(t *testing.T) {
 		if strings.Contains(line, "OTEL_EXPORTER_OTLP") && !strings.Contains(line, " command ") {
 			t.Errorf("profile sets OTEL_EXPORTER_OTLP_* outside a wrapper: %s", line)
 		}
-		if strings.Contains(line, testCfg.Key) && !strings.HasPrefix(line, "export FLOWSTATE_OTLP_KEY=") {
-			t.Errorf("key outside FLOWSTATE_OTLP_KEY: %s", line)
+		if strings.Contains(line, testCfg.Key) {
+			t.Errorf("profile stores the key (it belongs in the 0600 env file): %s", line)
 		}
 	}
 	for _, cmd := range []string{"copilot", "opencode", "gemini", "qwen"} {
@@ -710,6 +710,109 @@ func TestResourceAttributes_Scoped(t *testing.T) {
 	if !strings.Contains(readFile(t, c.settingsPath()), "deployment.environment=dev") {
 		t.Fatal("user's own OTEL_RESOURCE_ATTRIBUTES removed")
 	}
+
+	// With team/e-mail set, ours are merged in after the user's own keys,
+	// replacing a stale copy of ours; remove takes out only ours.
+	writeFile(t, c.settingsPath(), `{"env": {"OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=dev,flowstate.team_id=old,service.version=2"}}`)
+	install(t, c, cfg)
+	if !strings.Contains(readFile(t, c.settingsPath()), `"OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=dev,service.version=2,`+attrs+`"`) {
+		t.Fatalf("attributes not merged:\n%s", readFile(t, c.settingsPath()))
+	}
+	install(t, c, cfg)
+	if strings.Count(readFile(t, c.settingsPath()), "flowstate.team_id") != 1 {
+		t.Fatalf("attributes duplicated on re-install:\n%s", readFile(t, c.settingsPath()))
+	}
+	if err := c.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(readFile(t, c.settingsPath()), `"OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=dev,service.version=2"`) {
+		t.Fatalf("remove did not keep the user's attributes:\n%s", readFile(t, c.settingsPath()))
+	}
+}
+
+func TestMergeResourceAttrs(t *testing.T) {
+	for _, c := range []struct{ existing, ours, want string }{
+		{"", "", ""},
+		{"", "flowstate.email=e", "flowstate.email=e"},
+		{"a=1", "", "a=1"},
+		{"a=1, flowstate.email=old ,b=2", "flowstate.email=new", "a=1,b=2,flowstate.email=new"},
+		{"flowstate.team_id=t,flowstate.email=e", "", ""},
+		{"flowstate.other=x", "", "flowstate.other=x"},
+	} {
+		if got := mergeResourceAttrs(c.existing, c.ours); got != c.want {
+			t.Errorf("mergeResourceAttrs(%q, %q) = %q, want %q", c.existing, c.ours, got, c.want)
+		}
+	}
+}
+
+// Settings files that hold the key are created private (0600); an existing
+// file keeps its mode, stricter or not, and is never loosened.
+func TestKeySettingsFileModes(t *testing.T) {
+	sandbox(t)
+	withGeminiVersion(t, "0.65.0")
+	c, g, cc := &ClaudeCode{}, &GeminiCLI{}, &CopilotChat{}
+	if err := os.MkdirAll(cc.vsCodeSettingsDir(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	paths := map[Tool]string{c: c.settingsPath(), g: g.settingsPath(), cc: cc.settingsPath()}
+	for tool, path := range paths {
+		install(t, tool, testCfg)
+		if !strings.Contains(readFile(t, path), testCfg.Key) {
+			t.Fatalf("%s: key not written to %s", tool.Name(), path)
+		}
+		if st, _ := os.Stat(path); st.Mode().Perm() != 0600 {
+			t.Errorf("%s: new %s mode = %v, want 0600", tool.Name(), path, st.Mode().Perm())
+		}
+		for _, mode := range []os.FileMode{0400 | 0200, 0640} {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			install(t, tool, testCfg)
+			if st, _ := os.Stat(path); st.Mode().Perm() != mode {
+				t.Errorf("%s: existing mode %v changed to %v", tool.Name(), mode, st.Mode().Perm())
+			}
+		}
+	}
+}
+
+// Aider exports nothing; install removes the prompt/response history file
+// setting earlier releases wrote, and leaves a user's own setting alone.
+func TestAider_RemovesLegacyHistoryFile(t *testing.T) {
+	sandbox(t)
+	a := &AiderTool{}
+	install(t, a, testCfg)
+	if _, err := os.Stat(a.configPath()); !os.IsNotExist(err) {
+		t.Fatal("install created ~/.aider.conf.yml with nothing to configure")
+	}
+
+	writeFile(t, a.configPath(), "model: sonnet\nllm-history-file: "+legacyAiderHistoryFile+"\n")
+	cfg, _ := a.readConfig()
+	if !hasLegacyHistory(cfg) {
+		t.Fatal("legacy setting not recognised")
+	}
+	install(t, a, testCfg)
+	got := readFile(t, a.configPath())
+	if strings.Contains(got, "llm-history-file") || !strings.Contains(got, "model: sonnet") {
+		t.Fatalf("install result wrong:\n%s", got)
+	}
+
+	writeFile(t, a.configPath(), "llm-history-file: /home/me/aider.log\n")
+	install(t, a, testCfg)
+	if err := a.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(readFile(t, a.configPath()), "/home/me/aider.log") {
+		t.Fatal("user's own llm-history-file removed")
+	}
+}
+
+func TestOpenCode_WrapperPinsHTTPJSON(t *testing.T) {
+	sandbox(t)
+	o := &OpenCodeTool{}
+	install(t, o, testCfg)
+	if !strings.Contains(shell.ToolBlock(o.Name()), " OTEL_EXPORTER_OTLP_PROTOCOL=http/json ") {
+		t.Fatalf("wrapper lacks OTEL_EXPORTER_OTLP_PROTOCOL=http/json:\n%s", shell.ToolBlock(o.Name()))
+	}
 }
 
 func TestHookCommand_QuotesPaths(t *testing.T) {
@@ -718,5 +821,27 @@ func TestHookCommand_QuotesPaths(t *testing.T) {
 	}
 	if !isFlowstateHook(map[string]interface{}{"command": `'/a b/flowstate.sh' stop`}, "/a b/flowstate.sh") {
 		t.Fatal("quoted command not recognised")
+	}
+}
+
+// verify warns while the profile still stores the key in plain text (an
+// earlier release's block), and when the env file the block reads is gone.
+func TestVerifyEnvironment_KeyInProfile(t *testing.T) {
+	sandbox(t)
+	writeFile(t, shell.ProfilePath(), "# --- Flowstate Telemetry ---\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.host\"\nexport FLOWSTATE_OTLP_KEY=\"k\"\n# --- End Flowstate Telemetry ---\n")
+	if res := VerifyEnvironment(testCfg); !strings.Contains(res.Warning, "stores the key in plain text") {
+		t.Fatalf("no plain-text key warning: %+v", res)
+	}
+	if err := shell.WriteEnvVars(testCfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if res := VerifyEnvironment(testCfg); !strings.Contains(res.Warning, "missing") {
+		t.Fatalf("no missing env file warning: %+v", res)
+	}
+	if err := hooks.WriteEnvFile(testCfg); err != nil {
+		t.Fatal(err)
+	}
+	if res := VerifyEnvironment(testCfg); !res.OK || res.Warning != "" {
+		t.Fatalf("VerifyEnvironment: %+v", res)
 	}
 }

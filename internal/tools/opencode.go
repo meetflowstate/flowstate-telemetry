@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
@@ -13,9 +14,10 @@ import (
 // OpenCodeTool configures telemetry for the OpenCode editor.
 //
 // `experimental.openTelemetry` turns on OpenCode's built-in exporter, which
-// reads only OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_HEADERS from
-// its environment and posts OTLP/HTTP JSON logs and traces to
-// <endpoint>/v1/{logs,traces}. opencode.json has no env block, so the
+// reads OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_HEADERS from its
+// environment and posts OTLP/HTTP JSON logs and traces to
+// <endpoint>/v1/{logs,traces}; the wrapper also pins
+// OTEL_EXPORTER_OTLP_PROTOCOL=http/json. opencode.json has no env block, so the
 // variables are scoped to an `opencode` wrapper function in the shell profile
 // (exporting OTEL_EXPORTER_OTLP_ENDPOINT would redirect every other OTel SDK
 // started from the shell).
@@ -48,6 +50,9 @@ func openCodeBlock(cfg config.Config) []string {
 		"# Scopes OpenTelemetry settings to OpenCode only.",
 		shell.WrapperFunction("opencode", append([]string{
 			fmt.Sprintf(`OTEL_EXPORTER_OTLP_ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-%s}"`, cfg.BaseEndpoint()),
+			// OpenCode posts OTLP/HTTP JSON; say so, so a protocol the user
+			// set for another tool (grpc, http/protobuf) cannot leak in.
+			"OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
 			fmt.Sprintf(`OTEL_EXPORTER_OTLP_HEADERS="%s=${FLOWSTATE_OTLP_KEY:-}"`, config.AuthHeader),
 		}, resourceAttrsAssignment(cfg)...)),
 	}
@@ -171,9 +176,15 @@ func (o *OpenCodeTool) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: fmt.Sprintf("opencode wrapper missing from %s", shell.ProfilePath())}
 	}
 
+	var warning string
+	if !strings.Contains(shell.ToolBlock(o.Name()), "OTEL_EXPORTER_OTLP_PROTOCOL=http/json") {
+		warning = "the opencode wrapper does not set OTEL_EXPORTER_OTLP_PROTOCOL=http/json (re-run install)"
+	}
+
 	return VerifyResult{
 		OK:      true,
 		Message: "experimental.openTelemetry=true · OTLP/HTTP JSON logs+traces",
+		Warning: warning,
 		Notes: []string{
 			"upstream marks experimental.openTelemetry deprecated; it may stop working in OpenCode 2.x",
 			"only `opencode` started from a shell that reads " + shell.ProfilePath() + " is covered",

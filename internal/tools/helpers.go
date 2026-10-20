@@ -147,6 +147,48 @@ func resourceAttrsAssignment(cfg config.Config) []string {
 	return []string{shell.EnvAssignment("OTEL_RESOURCE_ATTRIBUTES", attrs)}
 }
 
+// mergeResourceAttrs returns the OTEL_RESOURCE_ATTRIBUTES value existing
+// with this CLI's flowstate.* entries replaced by ours ("" removes them),
+// keeping the user's own entries in their order.
+func mergeResourceAttrs(existing, ours string) string {
+	var kept []string
+	for _, kv := range strings.Split(existing, ",") {
+		kv = strings.TrimSpace(kv)
+		if kv == "" || isFlowstateAttr(kv) {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	if ours != "" {
+		kept = append(kept, ours)
+	}
+	return strings.Join(kept, ",")
+}
+
+// isFlowstateAttr reports whether one key=value resource attribute is one
+// this CLI writes.
+func isFlowstateAttr(kv string) bool {
+	k, _, _ := strings.Cut(kv, "=")
+	k = strings.TrimSpace(k)
+	return k == "flowstate.team_id" || k == "flowstate.email"
+}
+
+// setResourceAttrs merges ours into env["OTEL_RESOURCE_ATTRIBUTES"] (see
+// mergeResourceAttrs), deleting the key when nothing is left. A non-string
+// value is the user's and is left alone.
+func setResourceAttrs(env map[string]interface{}, ours string) {
+	raw, present := env["OTEL_RESOURCE_ATTRIBUTES"]
+	existing, isString := raw.(string)
+	if present && !isString {
+		return
+	}
+	if merged := mergeResourceAttrs(existing, ours); merged != "" {
+		env["OTEL_RESOURCE_ATTRIBUTES"] = merged
+	} else {
+		delete(env, "OTEL_RESOURCE_ATTRIBUTES")
+	}
+}
+
 // isFlowstateResourceAttrs reports whether an OTEL_RESOURCE_ATTRIBUTES value
 // is one this CLI wrote.
 func isFlowstateResourceAttrs(v interface{}) bool {

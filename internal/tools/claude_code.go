@@ -51,7 +51,9 @@ func (c *ClaudeCode) writeSettings(settings map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
-	return os.WriteFile(c.settingsPath(), data, 0644)
+	// The file holds the key: a new file is private (0600); an existing
+	// file keeps its mode.
+	return os.WriteFile(c.settingsPath(), data, 0600)
 }
 
 func (c *ClaudeCode) Install(cfg config.Config) error {
@@ -78,11 +80,6 @@ func (c *ClaudeCode) Install(cfg config.Config) error {
 	if cfg.Prompts {
 		env["OTEL_LOG_USER_PROMPTS"] = "1"
 	}
-	// Team and e-mail are scoped to Claude Code here, never exported.
-	attrs := shell.ResourceAttributes(cfg)
-	if attrs != "" {
-		env["OTEL_RESOURCE_ATTRIBUTES"] = attrs
-	}
 
 	// Merge with existing env block
 	existingEnv, ok := settings["env"].(map[string]interface{})
@@ -94,9 +91,9 @@ func (c *ClaudeCode) Install(cfg config.Config) error {
 	if !cfg.Prompts {
 		delete(existingEnv, "OTEL_LOG_USER_PROMPTS")
 	}
-	if attrs == "" && isFlowstateResourceAttrs(existingEnv["OTEL_RESOURCE_ATTRIBUTES"]) {
-		delete(existingEnv, "OTEL_RESOURCE_ATTRIBUTES")
-	}
+	// Team and e-mail are scoped to Claude Code here, never exported. The
+	// user's own resource attributes are kept; only ours are replaced.
+	setResourceAttrs(existingEnv, shell.ResourceAttributes(cfg))
 	for k, v := range env {
 		existingEnv[k] = v
 	}
@@ -139,9 +136,7 @@ func (c *ClaudeCode) Remove() error {
 	for _, k := range keysToRemove {
 		delete(envBlock, k)
 	}
-	if isFlowstateResourceAttrs(envBlock["OTEL_RESOURCE_ATTRIBUTES"]) {
-		delete(envBlock, "OTEL_RESOURCE_ATTRIBUTES")
-	}
+	setResourceAttrs(envBlock, "")
 
 	if len(envBlock) == 0 {
 		delete(settings, "env")

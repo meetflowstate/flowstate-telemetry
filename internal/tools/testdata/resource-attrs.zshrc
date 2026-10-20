@@ -1,4 +1,3 @@
-
 # --- Flowstate Telemetry: copilot-cli ---
 # Scopes OpenTelemetry settings to the Copilot CLI only.
 function copilot { COPILOT_OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-https://otel.flowstate.host}" OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_RESOURCE_ATTRIBUTES='flowstate.team_id=team-1,flowstate.email=dev@example.com' command copilot "$@"; }
@@ -6,7 +5,7 @@ function copilot { COPILOT_OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT="${FLOW
 
 # --- Flowstate Telemetry: opencode ---
 # Scopes OpenTelemetry settings to OpenCode only.
-function opencode { OTEL_EXPORTER_OTLP_ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-https://otel.flowstate.host}" OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" OTEL_RESOURCE_ATTRIBUTES='flowstate.team_id=team-1,flowstate.email=dev@example.com' command opencode "$@"; }
+function opencode { OTEL_EXPORTER_OTLP_ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-https://otel.flowstate.host}" OTEL_EXPORTER_OTLP_PROTOCOL=http/json OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" OTEL_RESOURCE_ATTRIBUTES='flowstate.team_id=team-1,flowstate.email=dev@example.com' command opencode "$@"; }
 # --- End Flowstate Telemetry: opencode ---
 
 # --- Flowstate Telemetry: gemini-cli ---
@@ -21,5 +20,6 @@ function qwen { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXP
 
 # --- Flowstate Telemetry ---
 export FLOWSTATE_OTLP_ENDPOINT="https://otel.flowstate.host"
-export FLOWSTATE_OTLP_KEY="fs_test_key"
+# FLOWSTATE_OTLP_KEY is read from the env file (mode 0600), not stored here.
+_fs_env='$HOME/.config/flowstate-telemetry/env'; if [ -r "$_fs_env" ]; then while IFS= read -r _fs_l || [ -n "$_fs_l" ]; do case "$_fs_l" in FLOWSTATE_OTLP_KEY=*) export FLOWSTATE_OTLP_KEY="${_fs_l#FLOWSTATE_OTLP_KEY=}"; break ;; esac; done < "$_fs_env"; fi; unset _fs_env _fs_l
 # --- End Flowstate Telemetry ---

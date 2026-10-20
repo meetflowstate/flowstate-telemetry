@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -40,7 +41,13 @@ func VerifyEnvironment(cfg config.Config) VerifyResult {
 		errs = append(errs, "OTEL_RESOURCE_ATTRIBUTES carrying flowstate.team_id/flowstate.email is exported in this shell: every OpenTelemetry SDK sends it to its own collector ("+reinstall+"; check machine-wide files too)")
 	}
 
+	var warnings []string
 	if block := shell.MainBlock(); block != "" {
+		if regexp.MustCompile(`(?m)^\s*export FLOWSTATE_OTLP_KEY=`).MatchString(block) {
+			warnings = append(warnings, fmt.Sprintf("%s stores the key in plain text (re-run install: it moves to %s, mode 0600)", shell.ProfilePath(), hooks.EnvFilePath()))
+		} else if _, err := os.Stat(hooks.EnvFilePath()); err != nil {
+			warnings = append(warnings, fmt.Sprintf("%s missing: shells get no FLOWSTATE_OTLP_KEY, so the wrappers send no key (re-run install with --key)", hooks.EnvFilePath()))
+		}
 		if config.ContainsLegacyEndpoint(block) {
 			errs = append(errs, fmt.Sprintf("%s exports the retired otel.flowstate.inc endpoint (%s)", shell.ProfilePath(), reinstall))
 		}
@@ -84,7 +91,8 @@ func VerifyEnvironment(cfg config.Config) VerifyResult {
 	}
 
 	if len(errs) > 0 {
-		return VerifyResult{OK: false, Message: strings.Join(errs, "; ")}
+		return VerifyResult{OK: false, Message: strings.Join(errs, "; "), Warning: joinWarnings(warnings)}
 	}
-	return VerifyResult{OK: true, Message: fmt.Sprintf("endpoint %s · key and resource attributes not exported to other OpenTelemetry SDKs", cfg.BaseEndpoint())}
+	return VerifyResult{OK: true, Message: fmt.Sprintf("endpoint %s · key and resource attributes not exported to other OpenTelemetry SDKs", cfg.BaseEndpoint()),
+		Warning: joinWarnings(warnings)}
 }

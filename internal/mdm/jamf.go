@@ -3,6 +3,7 @@ package mdm
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/template"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -21,11 +22,15 @@ const jamfTemplate = `#!/bin/bash
 # The key is never exported as OTEL_EXPORTER_OTLP_HEADERS (every OpenTelemetry
 # SDK would send it to its own collector). It goes only into each user's tool
 # settings and ~/.config/flowstate-telemetry/env (mode 0600), which the
-# Cursor/Windsurf/Antigravity hook scripts read.
+# Cursor/Windsurf/Antigravity hook scripts read. Every file under a home
+# directory is written by that user (sudo -u), never by root, and the key is
+# passed on stdin or in the environment, never on a command line.
 set -euo pipefail
 
-ENDPOINT="{{ .Endpoint }}"
-KEY="${4:-{{ .Key }}}"
+ENDPOINT={{ sh .Endpoint }}
+# shellcheck disable=SC2016 # the key is literal
+DEFAULT_KEY={{ sh .Key }}
+KEY="${4:-$DEFAULT_KEY}"
 
 echo "==> Configuring Flowstate telemetry for all users..."
 
@@ -48,23 +53,34 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
     fi
 fi
 
-# Configure Claude Code for each user
-for HOMEDIR in /Users/*; do
-    [ -d "$HOMEDIR" ] || continue
-    USERNAME=$(basename "$HOMEDIR")
-    [ "$USERNAME" = "Shared" ] && continue
+# A python3 that runs without prompting: /usr/bin/python3 is only a stub
+# until the Command Line Tools are installed.
+PYTHON=""
+if /usr/bin/xcode-select -p >/dev/null 2>&1 && [ -x /usr/bin/python3 ]; then
+    PYTHON=/usr/bin/python3
+else
+    for CANDIDATE in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if [ -x "$CANDIDATE" ]; then
+            PYTHON="$CANDIDATE"
+            break
+        fi
+    done
+fi
 
-    # Claude Code settings
-    CLAUDE_DIR="$HOMEDIR/.claude"
-    mkdir -p "$CLAUDE_DIR"
-    SETTINGS="$CLAUDE_DIR/settings.json"
-
-    if [ -f "$SETTINGS" ]; then
-        # Merge with existing settings using Python (available on macOS)
-        python3 -c "
-import json, sys
-with open('$SETTINGS') as f:
-    s = json.load(f)
+# Merges Flowstate's env block into a Claude Code settings.json (argv[1]).
+# The endpoint and key come from FS_ENDPOINT / FS_KEY in the environment,
+# never the command line (visible in ps). It writes a temp file next to the
+# target and renames it over: a new file is 0600, an existing one keeps its
+# mode.
+read -r -d '' MERGE_CLAUDE <<'PYEOF' || true
+import json, os, sys, tempfile
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        s = json.load(f)
+    mode = os.stat(path).st_mode & 0o777
+except FileNotFoundError:
+    s, mode = {}, 0o600
 env = s.setdefault('env', {})
 env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
 env.update({
@@ -72,64 +88,106 @@ env.update({
     'OTEL_METRICS_EXPORTER': 'otlp',
     'OTEL_LOGS_EXPORTER': 'otlp',
     'OTEL_EXPORTER_OTLP_PROTOCOL': 'http/protobuf',
-    'OTEL_EXPORTER_OTLP_ENDPOINT': '$ENDPOINT',
-    'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=$KEY',
+    'OTEL_EXPORTER_OTLP_ENDPOINT': os.environ['FS_ENDPOINT'],
+    'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=' + os.environ['FS_KEY'],
     'OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE': 'delta',
     'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
-    'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true'
+    'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true',
 })
-with open('$SETTINGS', 'w') as f:
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.settings.json.')
+with os.fdopen(fd, 'w') as f:
     json.dump(s, f, indent=2)
-"
-    else
-        cat > "$SETTINGS" <<CLAUDEEOF
+    f.write('\n')
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PYEOF
+
+# Configures one user's files. It runs AS that user (sudo -u), never as root:
+# a symlink the user planted under their home can then only redirect a write
+# to a file they could already write, and nothing needs chown. The endpoint
+# and key arrive on stdin, never on a command line (visible in ps).
+# Arguments: home directory, python3 path ("" if none), merge script.
+# shellcheck disable=SC2329 # run under sudo via declare -f
+configure_user() {
+    set -euo pipefail
+    local home="$1" python="$2" merge="$3" endpoint key dir tmp settings
+    IFS= read -r endpoint
+    IFS= read -r key
+    umask 077
+
+    # Endpoint and key for hook scripts (editors launched from the Dock do
+    # not read shell profiles). Readable by this user only.
+    dir="$home/.config/flowstate-telemetry"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    tmp=$(mktemp "$dir/.env.XXXXXX")
+    printf 'FLOWSTATE_OTLP_ENDPOINT=%s\nFLOWSTATE_OTLP_KEY=%s\n' "$endpoint" "$key" > "$tmp"
+    mv -f "$tmp" "$dir/env"
+
+    # Claude Code settings (holds the key: a new file is 0600)
+    mkdir -p "$home/.claude"
+    settings="$home/.claude/settings.json"
+    if [ -n "$python" ]; then
+        FS_ENDPOINT="$endpoint" FS_KEY="$key" "$python" -c "$merge" "$settings"
+    elif [ ! -e "$settings" ]; then
+        tmp=$(mktemp "$home/.claude/.settings.json.XXXXXX")
+        cat > "$tmp" <<CLAUDEEOF
 {
   "env": {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_METRICS_EXPORTER": "otlp",
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "$ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=$KEY",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "$endpoint",
+    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=$key",
     "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
     "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
   }
 }
 CLAUDEEOF
-    fi
-    chown "$USERNAME" "$SETTINGS" "$CLAUDE_DIR"
-
-    # Endpoint and key for hook scripts (editors launched from the Dock do
-    # not read shell profiles). Readable by this user only.
-    if [ ! -d "$HOMEDIR/.config" ]; then
-        mkdir "$HOMEDIR/.config"
-        chown "$USERNAME" "$HOMEDIR/.config"
-    fi
-    CONF_DIR="$HOMEDIR/.config/flowstate-telemetry"
-    mkdir -p "$CONF_DIR"
-    chmod 700 "$CONF_DIR"
-    (umask 077; printf 'FLOWSTATE_OTLP_ENDPOINT=%s\nFLOWSTATE_OTLP_KEY=%s\n' "$ENDPOINT" "$KEY" > "$CONF_DIR/env")
-    chown -R "$USERNAME" "$CONF_DIR"
-
-    # Cursor hooks
-    CURSOR_DIR="$HOMEDIR/.cursor"
-    if [ -d "$CURSOR_DIR" ] || [ -d "/Applications/Cursor.app" ]; then
-        mkdir -p "$CURSOR_DIR/hooks"
-        # Hook script would be deployed separately or embedded here
-        chown -R "$USERNAME" "$CURSOR_DIR"
+        mv -f "$tmp" "$settings"
+    else
+        echo "  warning: python3 not available (install the Command Line Tools): $settings not merged" >&2
     fi
 
-    echo "  Configured: $USERNAME"
+    # Cursor hooks directory (the hook script is deployed separately)
+    if [ -d "$home/.cursor" ] || [ -d /Applications/Cursor.app ]; then
+        mkdir -p "$home/.cursor/hooks"
+    fi
+}
+
+# Configure each user
+FAILED=0
+for HOMEDIR in /Users/*; do
+    [ -d "$HOMEDIR" ] && [ ! -L "$HOMEDIR" ] || continue
+    USERNAME=$(basename "$HOMEDIR")
+    [ "$USERNAME" = "Shared" ] && continue
+    # Only a real account's own home directory.
+    id -u "$USERNAME" >/dev/null 2>&1 || continue
+    [ "$(stat -f %Su "$HOMEDIR")" = "$USERNAME" ] || continue
+
+    if printf '%s\n%s\n' "$ENDPOINT" "$KEY" |
+        sudo -u "$USERNAME" -H /bin/bash -c "$(declare -f configure_user); configure_user \"\$@\"" \
+            flowstate-telemetry "$HOMEDIR" "$PYTHON" "$MERGE_CLAUDE"; then
+        echo "  Configured: $USERNAME"
+    else
+        echo "  Failed: $USERNAME" >&2
+        FAILED=1
+    fi
 done
 
+if [ "$FAILED" -ne 0 ]; then
+    echo "==> Flowstate telemetry configuration failed for some users." >&2
+    exit 1
+fi
 echo "==> Flowstate telemetry configuration complete."
 exit 0
 `
 
 // GenerateJamf writes a Jamf Pro deployment script to the given writer.
 func GenerateJamf(w io.Writer, cfg config.Config) error {
-	tmpl, err := template.New("jamf").Parse(jamfTemplate)
+	tmpl, err := template.New("jamf").Funcs(template.FuncMap{"sh": shQuote}).Parse(jamfTemplate)
 	if err != nil {
 		return fmt.Errorf("parsing template: %w", err)
 	}
@@ -138,4 +196,9 @@ func GenerateJamf(w io.Writer, cfg config.Config) error {
 		"Endpoint": cfg.Endpoint,
 		"Key":      cfg.Key,
 	})
+}
+
+// shQuote single-quotes s for bash, so a key or endpoint is used literally.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

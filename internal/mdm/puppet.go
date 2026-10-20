@@ -3,6 +3,7 @@ package mdm
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/template"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -18,11 +19,19 @@ const puppetTemplate = `# Flowstate Telemetry — Puppet Manifest
 #
 # The key is never exported as OTEL_EXPORTER_OTLP_HEADERS (every OpenTelemetry
 # SDK would send it to its own collector): it goes into each tool's own
-# settings, and Gemini CLI gets it from a "gemini" wrapper function.
+# settings and ~/.config/flowstate-telemetry/env (mode 0600). The shell
+# profile (~/.bashrc, and ~/.zshrc on macOS) reads it from there at start-up
+# and Gemini CLI gets it from a "gemini" wrapper function; no profile stores
+# the key.
+#
+# The env file, Claude Code's settings.json (merged: the user's own settings
+# are kept) and the profile block are written by a script Puppet runs AS each
+# user, so root never writes through a path the user controls. The key
+# reaches it in the environment, never on a command line.
 
 class flowstate_telemetry (
-  String $endpoint = '{{ .Endpoint }}',
-  String $key      = '{{ .Key }}',
+  String $endpoint = {{ pp .Endpoint }},
+  String $key      = {{ pp .Key }},
 ) {
 
   # Earlier versions exported the key (and OTEL_EXPORTER_OTLP_HEADERS) to
@@ -31,45 +40,144 @@ class flowstate_telemetry (
     ensure => absent,
   }
 
-  # Configure Claude Code for each developer user
+  # /opt may not exist yet (macOS): create the parents too.
+  exec { 'flowstate-telemetry-dir':
+    command => '/bin/mkdir -p /opt/flowstate-telemetry',
+    creates => '/opt/flowstate-telemetry',
+  }
+
+  file { '/opt/flowstate-telemetry':
+    ensure  => directory,
+    owner   => 'root',
+    mode    => '0755',
+    require => Exec['flowstate-telemetry-dir'],
+  }
+
+  # Per-user configuration, run as the user. With --check it changes nothing
+  # and exits 1 when an update is needed (the exec's unless).
+  file { '/opt/flowstate-telemetry/configure-user.py':
+    ensure  => file,
+    owner   => 'root',
+    mode    => '0755',
+    content => @(PYEOF),
+      import json, os, re, sys, tempfile
+
+      home = os.environ['HOME']
+      endpoint = os.environ['FS_ENDPOINT']
+      key = os.environ['FS_KEY']
+      rc_files = os.environ.get('FS_RC_FILES', '.bashrc').split()
+      check = '--check' in sys.argv[1:]
+
+      BEGIN, END = '# BEGIN Flowstate Telemetry', '# END Flowstate Telemetry'
+      BLOCK = re.compile('^' + re.escape(BEGIN) + r'\n.*?^' + re.escape(END) + r'$\n?', re.M | re.S)
+      # Lines earlier versions of this manifest wrote (the key in plain text).
+      LEGACY = re.compile(r'^(export FLOWSTATE_OTLP_ENDPOINT=.*FLOWSTATE_OTLP_KEY=.*|gemini\(\) \{ OTEL_EXPORTER_OTLP.*)$\n?', re.M)
+      PROFILE_LINES = [
+{{- range .ProfileLines }}
+          r'''{{ . }}''',
+{{- end }}
+      ]
+
+
+      def read(path):
+          try:
+              with open(path) as f:
+                  return f.read()
+          except FileNotFoundError:
+              return None
+
+
+      def write(path, text, new_mode, force_mode):
+          # Temp file and rename: a new file gets new_mode; an existing file
+          # keeps its mode unless force_mode.
+          try:
+              mode = new_mode if force_mode else os.stat(path).st_mode & 0o777
+          except FileNotFoundError:
+              mode = new_mode
+          fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.' + os.path.basename(path) + '.')
+          with os.fdopen(fd, 'w') as f:
+              f.write(text)
+          os.chmod(tmp, mode)
+          os.replace(tmp, path)
+
+
+      updates = []
+
+      conf = os.path.join(home, '.config', 'flowstate-telemetry')
+      env_path = os.path.join(conf, 'env')
+      env_text = 'FLOWSTATE_OTLP_ENDPOINT=%s\nFLOWSTATE_OTLP_KEY=%s\n' % (endpoint, key)
+      env_mode = os.stat(env_path).st_mode & 0o777 if os.path.exists(env_path) else None
+      if read(env_path) != env_text or env_mode != 0o600:
+          updates.append((env_path, env_text, 0o600, True))
+
+      claude_path = os.path.join(home, '.claude', 'settings.json')
+      raw = read(claude_path)
+      settings = json.loads(raw) if raw else {}
+      env = settings.setdefault('env', {})
+      env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
+      env.update({
+          'CLAUDE_CODE_ENABLE_TELEMETRY': '1',
+          'OTEL_METRICS_EXPORTER': 'otlp',
+          'OTEL_LOGS_EXPORTER': 'otlp',
+          'OTEL_EXPORTER_OTLP_PROTOCOL': 'http/protobuf',
+          'OTEL_EXPORTER_OTLP_ENDPOINT': endpoint,
+          'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=' + key,
+          'OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE': 'delta',
+          'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
+          'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true',
+      })
+      if not raw or json.loads(raw) != settings:
+          updates.append((claude_path, json.dumps(settings, indent=2) + '\n', 0o600, False))
+
+      block = '\n'.join([BEGIN, 'export FLOWSTATE_OTLP_ENDPOINT="%s"' % endpoint] + PROFILE_LINES + [END]) + '\n'
+      for name in rc_files:
+          path = os.path.join(home, name)
+          old = read(path) or ''
+          text = LEGACY.sub('', BLOCK.sub('', old))
+          if text and not text.endswith('\n'):
+              text += '\n'
+          text += block
+          if text != old:
+              updates.append((path, text, 0o644, False))
+
+      if check:
+          sys.exit(1 if updates else 0)
+      os.makedirs(conf, 0o700, exist_ok=True)
+      os.chmod(conf, 0o700)
+      os.makedirs(os.path.dirname(claude_path), 0o755, exist_ok=True)
+      for path, text, mode, force in updates:
+          write(path, text, mode, force)
+      | PYEOF
+    require => File['/opt/flowstate-telemetry'],
+  }
+
+  $rc_files = $facts['os']['family'] ? {
+    'Darwin' => '.bashrc .zshrc',
+    default  => '.bashrc',
+  }
+
+  # Configure each developer user
   $users = query_resources(false, ['=', 'type', 'User'])
 
   $users.each |$user_resource| {
     $username = $user_resource['title']
     $homedir  = $user_resource['parameters']['home']
 
-    if $homedir and $homedir =~ /^\/home\// {
+    if $homedir and $homedir =~ /^\/(home|Users)\// {
 
-      # Claude Code settings
-      file { "${homedir}/.claude":
-        ensure => directory,
-        owner  => $username,
-        mode   => '0755',
+      # Env file, Claude Code settings (merged) and the shell profile block,
+      # written by the user. The key is passed in the environment.
+      exec { "flowstate-telemetry-${username}":
+        command     => '/usr/bin/env python3 /opt/flowstate-telemetry/configure-user.py',
+        unless      => '/usr/bin/env python3 /opt/flowstate-telemetry/configure-user.py --check',
+        user        => $username,
+        cwd         => $homedir,
+        environment => ["HOME=${homedir}", "FS_ENDPOINT=${endpoint}", "FS_KEY=${key}", "FS_RC_FILES=${rc_files}"],
+        path        => ['/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/bin'],
+        require     => File['/opt/flowstate-telemetry/configure-user.py'],
       }
 
-      file { "${homedir}/.claude/settings.json":
-        ensure  => file,
-        owner   => $username,
-        mode    => '0644',
-        content => @("CLAUDEEOF")
-          {
-            "env": {
-              "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-              "OTEL_METRICS_EXPORTER": "otlp",
-              "OTEL_LOGS_EXPORTER": "otlp",
-              "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-              "OTEL_EXPORTER_OTLP_ENDPOINT": "${endpoint}",
-              "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=${key}",
-              "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
-              "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
-              "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
-            }
-          }
-          | CLAUDEEOF
-        require => File["${homedir}/.claude"],
-      }
-
-      # VS Code Copilot Chat settings
+      # VS Code Copilot Chat settings (holds the key: 0600)
       $vscode_dir = "${homedir}/.config/Code/User"
 
       exec { "check-vscode-${username}":
@@ -80,7 +188,7 @@ class flowstate_telemetry (
       file { "${vscode_dir}/settings.json":
         ensure  => file,
         owner   => $username,
-        mode    => '0644',
+        mode    => '0600',
         replace => false,
         content => @("VSCODEEOF")
           {
@@ -94,7 +202,7 @@ class flowstate_telemetry (
         require => Exec["check-vscode-${username}"],
       }
 
-      # Gemini CLI settings
+      # Gemini CLI settings (no key: the gemini wrapper adds it)
       file { "${homedir}/.gemini":
         ensure => directory,
         owner  => $username,
@@ -119,20 +227,6 @@ class flowstate_telemetry (
           | GEMINIEOF
         require => File["${homedir}/.gemini"],
       }
-
-      # Shell profile
-      file_line { "flowstate-env-${username}":
-        path  => "${homedir}/.bashrc",
-        line  => "export FLOWSTATE_OTLP_ENDPOINT=\"${endpoint}\" FLOWSTATE_OTLP_KEY=\"${key}\"",
-        match => '^export FLOWSTATE_OTLP_ENDPOINT=',
-      }
-
-      # Scopes the key and delta temporality to Gemini CLI only.
-      file_line { "flowstate-gemini-${username}":
-        path  => "${homedir}/.bashrc",
-        line  => 'gemini() { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" command gemini "$@"; }',
-        match => '^gemini\(\) \{ OTEL_EXPORTER_OTLP',
-      }
     }
   }
 }
@@ -142,13 +236,19 @@ include flowstate_telemetry
 
 // GeneratePuppet writes a Puppet manifest for Flowstate telemetry deployment.
 func GeneratePuppet(w io.Writer, cfg config.Config) error {
-	tmpl, err := template.New("puppet").Parse(puppetTemplate)
+	tmpl, err := template.New("puppet").Funcs(template.FuncMap{"pp": puppetQuote}).Parse(puppetTemplate)
 	if err != nil {
 		return fmt.Errorf("parsing template: %w", err)
 	}
 
-	return tmpl.Execute(w, map[string]string{
-		"Endpoint": cfg.Endpoint,
-		"Key":      cfg.Key,
+	return tmpl.Execute(w, map[string]interface{}{
+		"Endpoint":     cfg.Endpoint,
+		"Key":          cfg.Key,
+		"ProfileLines": profileLines(),
 	})
+}
+
+// puppetQuote renders s as a single-quoted Puppet string.
+func puppetQuote(s string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
 }

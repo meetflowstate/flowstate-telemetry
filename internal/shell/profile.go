@@ -169,8 +169,9 @@ func removeBlock(start, end string) error {
 // the key from its own settings, or from a wrapper function scoped to that
 // one command (WriteToolBlock).
 //
-// OTEL_RESOURCE_ATTRIBUTES deliberately carries no service.name: each tool
-// sets its own, and overriding it would make every tool look the same.
+// OTEL_RESOURCE_ATTRIBUTES is not exported either: it would attach
+// flowstate.email and flowstate.team_id to every OTel program's telemetry,
+// whatever collector it goes to. Tools get it scoped, like the key.
 func buildEnvBlock(cfg config.Config) string {
 	var lines []string
 	lines = append(lines, markerStart)
@@ -180,16 +181,15 @@ func buildEnvBlock(cfg config.Config) string {
 		lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_KEY=%q", cfg.Key))
 	}
 
-	if attrs := ResourceAttributes(cfg); attrs != "" {
-		lines = append(lines, fmt.Sprintf("export OTEL_RESOURCE_ATTRIBUTES=%q", attrs))
-	}
 	lines = append(lines, markerEnd)
 
 	return strings.Join(lines, "\n")
 }
 
 // ResourceAttributes returns the OTEL_RESOURCE_ATTRIBUTES value (Flowstate
-// team and email only), or "" when neither is set.
+// team and email only), or "" when neither is set. It deliberately carries
+// no service.name: each tool sets its own. Callers scope it to one tool
+// (settings or a wrapper function); it is never exported globally.
 func ResourceAttributes(cfg config.Config) string {
 	var attrs []string
 	if cfg.TeamID != "" {
@@ -225,6 +225,12 @@ func removeExistingBlock(content, start, end string) string {
 	}
 
 	return content[:startIdx] + content[endIdx:]
+}
+
+// EnvAssignment renders NAME='value' for a wrapper function, single-quoting
+// value so it is used literally.
+func EnvAssignment(name, value string) string {
+	return name + "=" + shQuote(value)
 }
 
 // WrapperFunction renders a shell function that runs the real command with

@@ -46,10 +46,10 @@ func (o *OpenCodeTool) Detect() bool {
 func openCodeBlock(cfg config.Config) []string {
 	return []string{
 		"# Scopes OpenTelemetry settings to OpenCode only.",
-		shell.WrapperFunction("opencode", []string{
+		shell.WrapperFunction("opencode", append([]string{
 			fmt.Sprintf(`OTEL_EXPORTER_OTLP_ENDPOINT="${FLOWSTATE_OTLP_ENDPOINT:-%s}"`, cfg.BaseEndpoint()),
 			fmt.Sprintf(`OTEL_EXPORTER_OTLP_HEADERS="%s=${FLOWSTATE_OTLP_KEY:-}"`, config.AuthHeader),
-		}),
+		}, resourceAttrsAssignment(cfg)...)),
 	}
 }
 

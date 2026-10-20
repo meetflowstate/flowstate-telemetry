@@ -29,7 +29,6 @@ func TestBuildEnvBlock_Golden(t *testing.T) {
 	want := `# --- Flowstate Telemetry ---
 export FLOWSTATE_OTLP_ENDPOINT="https://otel.flowstate.host"
 export FLOWSTATE_OTLP_KEY="fs_key"
-export OTEL_RESOURCE_ATTRIBUTES="flowstate.team_id=team-1,flowstate.email=dev@example.com"
 # --- End Flowstate Telemetry ---`
 	if got := buildEnvBlock(cfg); got != want {
 		t.Fatalf("block mismatch\n got:\n%s\nwant:\n%s", got, want)
@@ -40,7 +39,9 @@ export OTEL_RESOURCE_ATTRIBUTES="flowstate.team_id=team-1,flowstate.email=dev@ex
 // SDK started from the shell would send it to its own collector.
 func TestBuildEnvBlock_NoGlobalOTelHeaders(t *testing.T) {
 	got := buildEnvBlock(config.Config{Endpoint: "https://otel.flowstate.host", Key: "k"})
-	if strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || strings.Contains(got, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+	got += buildEnvBlock(config.Config{Endpoint: "https://otel.flowstate.host", Key: "k", TeamID: "t", Email: "e@x"})
+	if strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || strings.Contains(got, "OTEL_EXPORTER_OTLP_ENDPOINT") ||
+		strings.Contains(got, "OTEL_RESOURCE_ATTRIBUTES") || strings.Contains(got, "e@x") {
 		t.Fatalf("block exports generic OTel variables:\n%s", got)
 	}
 }
@@ -64,7 +65,7 @@ func TestWriteEnvVars_DryRunRedactsKey(t *testing.T) {
 // global OTEL_EXPORTER_OTLP_HEADERS).
 func TestWriteEnvVars_ReplacesLegacyBlock(t *testing.T) {
 	profile := sandbox(t)
-	old := "export PATH=/x\n\n" + markerStart + "\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport FLOWSTATE_OTLP_KEY=\"k\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\n" + markerEnd + "\n"
+	old := "export PATH=/x\n\n" + markerStart + "\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport FLOWSTATE_OTLP_KEY=\"k\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\nexport OTEL_RESOURCE_ATTRIBUTES=\"flowstate.team_id=t,flowstate.email=e@x\"\n" + markerEnd + "\n"
 	if err := os.WriteFile(profile, []byte(old), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestWriteEnvVars_ReplacesLegacyBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := ProfileText()
-	if config.ContainsLegacyEndpoint(got) || strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || !strings.Contains(MainBlock(), config.DefaultEndpoint) {
+	if config.ContainsLegacyEndpoint(got) || strings.Contains(got, "OTEL_EXPORTER_OTLP_HEADERS") || strings.Contains(got, "OTEL_RESOURCE_ATTRIBUTES") || !strings.Contains(MainBlock(), config.DefaultEndpoint) {
 		t.Fatalf("legacy block survived:\n%s", got)
 	}
 }

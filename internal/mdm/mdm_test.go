@@ -108,6 +108,32 @@ func TestTemplates_NoGlobalOTelHeaders(t *testing.T) {
 	}
 }
 
+// Flowstate team/e-mail must never be exported as OTEL_RESOURCE_ATTRIBUTES
+// machine- or shell-wide; the templates may only clean up old values.
+func TestTemplates_NoGlobalResourceAttributes(t *testing.T) {
+	cfg := config.Config{Endpoint: "https://otel.flowstate.host", Key: "fs_key", TeamID: "team-1", Email: "dev@example.com"}
+	generators := map[string]func(io.Writer, config.Config) error{
+		"jamf": GenerateJamf, "intune": GenerateIntune, "ansible": GenerateAnsible, "puppet": GeneratePuppet,
+	}
+	for name, gen := range generators {
+		var buf bytes.Buffer
+		if err := gen(&buf, cfg); err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if !strings.Contains(line, "OTEL_RESOURCE_ATTRIBUTES") || strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			if !strings.Contains(line, "$null") && !strings.Contains(line, "GetEnvironmentVariable") && !strings.Contains(line, "regexp:") {
+				t.Errorf("%s sets OTEL_RESOURCE_ATTRIBUTES: %s", name, strings.TrimSpace(line))
+			}
+		}
+		if strings.Contains(buf.String(), "dev@example.com") || strings.Contains(buf.String(), "flowstate.team_id") {
+			t.Errorf("%s embeds the team/e-mail attributes", name)
+		}
+	}
+}
+
 func TestAnsible_IsValidYAML(t *testing.T) {
 	var buf bytes.Buffer
 	if err := GenerateAnsible(&buf, config.Config{Endpoint: "https://otel.flowstate.host", Key: "fs_key"}); err != nil {

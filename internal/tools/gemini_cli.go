@@ -28,11 +28,14 @@ type GeminiCLI struct{}
 // geminiStyleBlock renders the wrapper for Gemini CLI or Qwen Code. withKey
 // adds OTEL_EXPORTER_OTLP_HEADERS for builds that cannot take the key from
 // settings.json; the key itself comes from FLOWSTATE_OTLP_KEY at run time.
-func geminiStyleBlock(command, product string, withKey bool) []string {
+// Team and e-mail resource attributes are scoped here too (settings.json has
+// no option for them).
+func geminiStyleBlock(command, product string, withKey bool, cfg config.Config) []string {
 	assignments := []string{"OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta"}
 	if withKey {
 		assignments = append(assignments, fmt.Sprintf(`OTEL_EXPORTER_OTLP_HEADERS="%s=${FLOWSTATE_OTLP_KEY:-}"`, config.AuthHeader))
 	}
+	assignments = append(assignments, resourceAttrsAssignment(cfg)...)
 	return []string{
 		"# Scopes OpenTelemetry settings to " + product + " only.",
 		shell.WrapperFunction(command, assignments),
@@ -129,7 +132,7 @@ func (g *GeminiCLI) Install(cfg config.Config) error {
 	}
 
 	settings["telemetry"] = telemetry
-	block := geminiStyleBlock("gemini", "Gemini CLI", !inSettings)
+	block := geminiStyleBlock("gemini", "Gemini CLI", !inSettings, cfg)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")

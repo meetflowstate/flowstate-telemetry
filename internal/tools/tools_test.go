@@ -621,22 +621,94 @@ func TestVerifyEnvironment(t *testing.T) {
 	t.Setenv("FLOWSTATE_OTLP_ENDPOINT", "")
 
 	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-flowstate-key=k")
-	if res := VerifyEnvironment(testCfg); !res.OK || !strings.Contains(res.Warning, "OTEL_EXPORTER_OTLP_HEADERS") {
-		t.Fatalf("global headers not warned: %+v", res)
+	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Message, "OTEL_EXPORTER_OTLP_HEADERS") {
+		t.Fatalf("global headers not flagged: %+v", res)
 	}
 	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
 
-	writeFile(t, shell.ProfilePath(), "# --- Flowstate Telemetry ---\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\n# --- End Flowstate Telemetry ---\n")
-	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Warning, "globally") {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "flowstate.team_id=t,flowstate.email=e@x")
+	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Message, "OTEL_RESOURCE_ATTRIBUTES") {
+		t.Fatalf("global resource attributes not flagged: %+v", res)
+	}
+	// A user's own attributes are none of our business.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=dev")
+	if res := VerifyEnvironment(testCfg); !res.OK {
+		t.Fatalf("unrelated OTEL_RESOURCE_ATTRIBUTES flagged: %+v", res)
+	}
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+
+	writeFile(t, shell.ProfilePath(), "# --- Flowstate Telemetry ---\nexport FLOWSTATE_OTLP_ENDPOINT=\"https://otel.flowstate.inc\"\nexport OTEL_EXPORTER_OTLP_HEADERS=\"x-flowstate-key=k\"\nexport OTEL_RESOURCE_ATTRIBUTES=\"flowstate.team_id=t\"\n# --- End Flowstate Telemetry ---\n")
+	res := VerifyEnvironment(testCfg)
+	if res.OK || !strings.Contains(res.Message, "exports OTEL_EXPORTER_OTLP_HEADERS globally") || !strings.Contains(res.Message, "exports OTEL_RESOURCE_ATTRIBUTES globally") {
 		t.Fatalf("legacy profile block not flagged: %+v", res)
 	}
-	if err := shell.WriteEnvVars(testCfg, false); err != nil {
+	// install rewrites the block, which clears all of it.
+	if err := shell.WriteEnvVars(config.Config{Endpoint: testCfg.Endpoint, Key: testCfg.Key, TeamID: "t", Email: "e@x"}, false); err != nil {
 		t.Fatal(err)
 	}
+	if res := VerifyEnvironment(testCfg); !res.OK {
+		t.Fatalf("still failing after rewrite: %+v", res)
+	}
 
-	writeFile(t, etc, "PATH=/usr/bin\nOTEL_EXPORTER_OTLP_HEADERS=x-flowstate-key=k\nFLOWSTATE_OTLP_ENDPOINT=https://otel.flowstate.inc\n")
-	if res := VerifyEnvironment(testCfg); res.OK || !strings.Contains(res.Warning, etc) {
+	writeFile(t, etc, "PATH=/usr/bin\nOTEL_EXPORTER_OTLP_HEADERS=x-flowstate-key=k\nOTEL_RESOURCE_ATTRIBUTES=flowstate.email=e@x\nFLOWSTATE_OTLP_ENDPOINT=https://otel.flowstate.inc\n")
+	if res := VerifyEnvironment(testCfg); res.OK || strings.Count(res.Message, etc) != 3 {
 		t.Fatalf("MDM leftovers not flagged: %+v", res)
+	}
+}
+
+// Team and e-mail reach only the tools, scoped: Claude Code's env block and
+// the wrapper functions. Nothing exports them.
+func TestResourceAttributes_Scoped(t *testing.T) {
+	home := sandbox(t)
+	withGeminiVersion(t, "0.65.0")
+	cfg := testCfg
+	cfg.TeamID, cfg.Email = "team-1", "dev@example.com"
+	const attrs = "flowstate.team_id=team-1,flowstate.email=dev@example.com"
+
+	c := &ClaudeCode{}
+	writeFile(t, c.settingsPath(), `{"env": {"MY_VAR": "keep"}}`)
+	for _, tool := range []Tool{c, &CopilotCLI{}, &OpenCodeTool{}, &GeminiCLI{}, &QwenCode{}} {
+		install(t, tool, cfg)
+	}
+	if err := shell.WriteEnvVars(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(readFile(t, c.settingsPath()), `"OTEL_RESOURCE_ATTRIBUTES": "`+attrs+`"`) {
+		t.Fatalf("Claude Code env block lacks the attributes:\n%s", readFile(t, c.settingsPath()))
+	}
+	golden(t, home, "resource-attrs.zshrc", readFile(t, shell.ProfilePath()))
+	for _, tool := range []string{"copilot-cli", "opencode", "gemini-cli", "qwen-code"} {
+		if !strings.Contains(shell.ToolBlock(tool), "OTEL_RESOURCE_ATTRIBUTES='"+attrs+"' ") {
+			t.Errorf("%s wrapper lacks the attributes:\n%s", tool, shell.ToolBlock(tool))
+		}
+	}
+	for _, line := range strings.Split(readFile(t, shell.ProfilePath()), "\n") {
+		if strings.Contains(line, "OTEL_RESOURCE_ATTRIBUTES") && !strings.Contains(line, " command ") {
+			t.Errorf("OTEL_RESOURCE_ATTRIBUTES outside a wrapper: %s", line)
+		}
+	}
+	if res := VerifyEnvironment(cfg); !res.OK {
+		t.Fatalf("VerifyEnvironment: %+v", res)
+	}
+
+	// Re-installing without team/e-mail drops our attributes again.
+	install(t, c, testCfg)
+	if strings.Contains(readFile(t, c.settingsPath()), "OTEL_RESOURCE_ATTRIBUTES") {
+		t.Fatal("stale attributes left in the Claude Code env block")
+	}
+	install(t, c, cfg)
+	if err := c.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, c.settingsPath()); strings.Contains(got, "OTEL_RESOURCE_ATTRIBUTES") || !strings.Contains(got, "MY_VAR") {
+		t.Fatalf("remove result wrong:\n%s", got)
+	}
+
+	// A user's own attributes in Claude Code's env block are left alone.
+	writeFile(t, c.settingsPath(), `{"env": {"OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=dev"}}`)
+	install(t, c, testCfg)
+	if !strings.Contains(readFile(t, c.settingsPath()), "deployment.environment=dev") {
+		t.Fatal("user's own OTEL_RESOURCE_ATTRIBUTES removed")
 	}
 }
 

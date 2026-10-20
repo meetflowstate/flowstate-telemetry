@@ -137,6 +137,23 @@ func shellProfileName() string {
 	return shell.ProfilePath()
 }
 
+// resourceAttrsAssignment returns the scoped OTEL_RESOURCE_ATTRIBUTES
+// assignment for a wrapper function, or nil when there are none.
+func resourceAttrsAssignment(cfg config.Config) []string {
+	attrs := shell.ResourceAttributes(cfg)
+	if attrs == "" {
+		return nil
+	}
+	return []string{shell.EnvAssignment("OTEL_RESOURCE_ATTRIBUTES", attrs)}
+}
+
+// isFlowstateResourceAttrs reports whether an OTEL_RESOURCE_ATTRIBUTES value
+// is one this CLI wrote.
+func isFlowstateResourceAttrs(v interface{}) bool {
+	s, _ := v.(string)
+	return strings.Contains(s, "flowstate.team_id=") || strings.Contains(s, "flowstate.email=")
+}
+
 // legacyEndpoint returns a failing VerifyResult when endpoint is the retired
 // otel.flowstate.inc receiver, or nil.
 func legacyEndpoint(where, endpoint string) *VerifyResult {

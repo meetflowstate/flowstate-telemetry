@@ -83,7 +83,7 @@ func (q *QwenCode) Install(cfg config.Config) error {
 	}
 
 	settings["telemetry"] = telemetry
-	block := geminiStyleBlock("qwen", "Qwen Code", true)
+	block := geminiStyleBlock("qwen", "Qwen Code", true, cfg)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")

@@ -37,6 +37,7 @@ func copilotCLIBlock(cfg config.Config) []string {
 		fmt.Sprintf(`OTEL_EXPORTER_OTLP_HEADERS="%s=${FLOWSTATE_OTLP_KEY:-}"`, config.AuthHeader),
 		"OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta",
 	}
+	assignments = append(assignments, resourceAttrsAssignment(cfg)...)
 	if cfg.Prompts {
 		assignments = append(assignments, "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true")
 	}

@@ -21,10 +21,11 @@ var systemEnvFiles = []string{
 // VerifyEnvironment checks what is shared by every tool: the process
 // environment, the shell profile block, the hook env file, the --gui-env
 // LaunchAgent and machine-wide files. It fails on the retired
-// otel.flowstate.inc endpoint and warns when the key is exposed to every
-// OpenTelemetry SDK through a global OTEL_EXPORTER_OTLP_HEADERS.
+// otel.flowstate.inc endpoint, and when the key (OTEL_EXPORTER_OTLP_HEADERS)
+// or the Flowstate team/e-mail (OTEL_RESOURCE_ATTRIBUTES) is exported
+// globally, where every OpenTelemetry SDK would send it to its own collector.
 func VerifyEnvironment(cfg config.Config) VerifyResult {
-	var errs, warnings []string
+	var errs []string
 	reinstall := "re-run `flowstate-telemetry install` and open a new shell"
 
 	for _, name := range []string{"FLOWSTATE_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
@@ -33,15 +34,20 @@ func VerifyEnvironment(cfg config.Config) VerifyResult {
 		}
 	}
 	if strings.Contains(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"), config.AuthHeader) {
-		warnings = append(warnings, "OTEL_EXPORTER_OTLP_HEADERS carrying x-flowstate-key is exported in this shell: every OpenTelemetry SDK sends it to its own collector ("+reinstall+"; check machine-wide files too)")
+		errs = append(errs, "OTEL_EXPORTER_OTLP_HEADERS carrying x-flowstate-key is exported in this shell: every OpenTelemetry SDK sends it to its own collector ("+reinstall+"; check machine-wide files too)")
+	}
+	if isFlowstateResourceAttrs(os.Getenv("OTEL_RESOURCE_ATTRIBUTES")) {
+		errs = append(errs, "OTEL_RESOURCE_ATTRIBUTES carrying flowstate.team_id/flowstate.email is exported in this shell: every OpenTelemetry SDK sends it to its own collector ("+reinstall+"; check machine-wide files too)")
 	}
 
 	if block := shell.MainBlock(); block != "" {
 		if config.ContainsLegacyEndpoint(block) {
 			errs = append(errs, fmt.Sprintf("%s exports the retired otel.flowstate.inc endpoint (%s)", shell.ProfilePath(), reinstall))
 		}
-		if strings.Contains(block, "OTEL_EXPORTER_OTLP_HEADERS") {
-			warnings = append(warnings, fmt.Sprintf("%s exports OTEL_EXPORTER_OTLP_HEADERS globally (%s)", shell.ProfilePath(), reinstall))
+		for _, name := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_RESOURCE_ATTRIBUTES"} {
+			if strings.Contains(block, name) {
+				errs = append(errs, fmt.Sprintf("%s exports %s globally (%s)", shell.ProfilePath(), name, reinstall))
+			}
 		}
 	}
 
@@ -53,8 +59,10 @@ func VerifyEnvironment(cfg config.Config) VerifyResult {
 		if config.ContainsLegacyEndpoint(plist) {
 			errs = append(errs, fmt.Sprintf("%s sets the retired otel.flowstate.inc endpoint (%s)", shell.GUIEnvAgentPath(), reinstall))
 		}
-		if strings.Contains(plist, "OTEL_EXPORTER_OTLP_HEADERS") {
-			warnings = append(warnings, fmt.Sprintf("%s publishes OTEL_EXPORTER_OTLP_HEADERS to every GUI app (%s)", shell.GUIEnvAgentPath(), reinstall))
+		for _, name := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_RESOURCE_ATTRIBUTES"} {
+			if strings.Contains(plist, name) {
+				errs = append(errs, fmt.Sprintf("%s publishes %s to every GUI app (%s)", shell.GUIEnvAgentPath(), name, reinstall))
+			}
 		}
 	}
 
@@ -68,13 +76,15 @@ func VerifyEnvironment(cfg config.Config) VerifyResult {
 			errs = append(errs, fmt.Sprintf("%s sets the retired otel.flowstate.inc endpoint (left by an older MDM deployment; redeploy with the current generate-mdm output)", path))
 		}
 		if strings.Contains(text, "OTEL_EXPORTER_OTLP_HEADERS") && strings.Contains(text, config.AuthHeader) {
-			warnings = append(warnings, fmt.Sprintf("%s sets OTEL_EXPORTER_OTLP_HEADERS with the Flowstate key for every process (left by an older MDM deployment; redeploy with the current generate-mdm output)", path))
+			errs = append(errs, fmt.Sprintf("%s sets OTEL_EXPORTER_OTLP_HEADERS with the Flowstate key for every process (left by an older MDM deployment; redeploy with the current generate-mdm output)", path))
+		}
+		if strings.Contains(text, "OTEL_RESOURCE_ATTRIBUTES") && isFlowstateResourceAttrs(text) {
+			errs = append(errs, fmt.Sprintf("%s sets OTEL_RESOURCE_ATTRIBUTES with Flowstate team/e-mail for every process (remove it; tools get them scoped)", path))
 		}
 	}
 
 	if len(errs) > 0 {
-		return VerifyResult{OK: false, Message: strings.Join(errs, "; "), Warning: joinWarnings(warnings)}
+		return VerifyResult{OK: false, Message: strings.Join(errs, "; ")}
 	}
-	return VerifyResult{OK: true, Message: fmt.Sprintf("endpoint %s · key not exported to other OpenTelemetry SDKs", cfg.BaseEndpoint()),
-		Warning: joinWarnings(warnings)}
+	return VerifyResult{OK: true, Message: fmt.Sprintf("endpoint %s · key and resource attributes not exported to other OpenTelemetry SDKs", cfg.BaseEndpoint())}
 }

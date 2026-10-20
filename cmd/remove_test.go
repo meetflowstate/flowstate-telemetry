@@ -37,6 +37,65 @@ func TestRemoveAll_CleansUndetectedTools(t *testing.T) {
 	}
 }
 
+// removeEnv points HOME at a fresh directory with nothing on PATH (no tool
+// detected by its command) and returns it.
+func removeEnv(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("PATH", t.TempDir())
+	return home
+}
+
+func writeFile(t *testing.T, path, text string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runRemoveWith runs remove with --all or --tool name.
+func runRemoveWith(t *testing.T, all bool, tool string) error {
+	t.Helper()
+	oldAll, oldTool := flagRemoveAll, flagRemoveTool
+	flagRemoveAll, flagRemoveTool = all, tool
+	t.Cleanup(func() { flagRemoveAll, flagRemoveTool = oldAll, oldTool })
+	return runRemove(nil, nil)
+}
+
+// remove --all does not fail on a file it cannot parse for a tool that is
+// not configured (nothing of ours could be in it); it leaves the file alone.
+// Named with --tool, the same file still fails.
+func TestRemoveAll_UnparseableFileOfUnconfiguredToolIsAWarning(t *testing.T) {
+	home := removeEnv(t)
+	settings := filepath.Join(home, ".gemini", "settings.json")
+	writeFile(t, settings, "{bad")
+	if err := runRemoveWith(t, true, ""); err != nil {
+		t.Fatalf("remove --all failed on an unconfigured tool's broken file: %v", err)
+	}
+	if data, err := os.ReadFile(settings); err != nil || string(data) != "{bad" {
+		t.Fatalf("broken settings.json changed: %q, %v", data, err)
+	}
+	if err := runRemoveWith(t, false, "gemini-cli"); err == nil {
+		t.Fatal("remove --tool gemini-cli succeeded on a broken settings.json")
+	}
+}
+
+// A configured tool whose file cannot be parsed still fails remove --all.
+func TestRemoveAll_UnparseableFileOfConfiguredToolFails(t *testing.T) {
+	home := removeEnv(t)
+	writeFile(t, filepath.Join(home, ".cursor", "hooks", "flowstate.sh"), "#!/bin/sh\n")
+	writeFile(t, filepath.Join(home, ".cursor", "hooks.json"), "{bad")
+	if err := runRemoveWith(t, true, ""); err == nil {
+		t.Fatal("remove --all succeeded on a configured tool's broken hooks.json")
+	}
+}
+
 func TestProxyInstallIsDisabled(t *testing.T) {
 	err := runProxyInstall(nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "install --all") {

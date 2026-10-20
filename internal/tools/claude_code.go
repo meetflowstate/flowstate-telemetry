@@ -37,7 +37,7 @@ func (c *ClaudeCode) readSettings() (map[string]interface{}, error) {
 	}
 	var settings map[string]interface{}
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, fmt.Errorf("parsing settings: %w", err)
+		return nil, fmt.Errorf("parsing settings: %w", unparseable(err))
 	}
 	return settings, nil
 }

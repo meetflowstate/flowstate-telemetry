@@ -179,7 +179,7 @@ flowstate-telemetry generate-mdm --format puppet     # Puppet
 | `version` / `--version` | Print the version, commit, build date, Go version and platform.                                                                                                                                                                                |
 | `proxy`                 | Deprecated. The receiver no longer accepts proxy events and `proxy install` is disabled; `sudo flowstate-telemetry proxy uninstall` removes an earlier install (until then its daemon only tunnels traffic, intercepting and sending nothing). |
 
-`remove --all` cleans every tool's files whether or not the tool is still installed, so no key is left behind in, say, `~/.claude/settings.json` after `claude` itself was uninstalled.
+`remove --all` cleans every tool's files whether or not the tool is still installed, so no key is left behind in, say, `~/.claude/settings.json` after `claude` itself was uninstalled. A file it cannot parse (say, a broken `~/.gemini/settings.json`) for a tool that is not configured is left alone with a warning, not counted as a failure; for a configured tool, or one named with `--tool`, it still fails.
 
 ## Environment Variables
 

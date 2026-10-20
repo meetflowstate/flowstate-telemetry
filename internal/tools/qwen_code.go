@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,7 +52,7 @@ func (q *QwenCode) readSettings() (map[string]interface{}, error) {
 	}
 	var settings map[string]interface{}
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, fmt.Errorf("parsing settings: %w", err)
+		return nil, fmt.Errorf("parsing settings: %w", unparseable(err))
 	}
 	return settings, nil
 }
@@ -98,17 +99,16 @@ func (q *QwenCode) Install(cfg config.Config) error {
 }
 
 func (q *QwenCode) Remove() error {
+	// The shell block is removed even when the settings file cannot be.
+	var err error
 	if fileExists(q.settingsPath()) {
-		settings, err := q.readSettings()
-		if err != nil {
-			return err
-		}
-		delete(settings, "telemetry")
-		if err := q.writeSettings(settings); err != nil {
-			return err
+		var settings map[string]interface{}
+		if settings, err = q.readSettings(); err == nil {
+			delete(settings, "telemetry")
+			err = q.writeSettings(settings)
 		}
 	}
-	return shell.RemoveToolBlock(q.Name())
+	return errors.Join(err, shell.RemoveToolBlock(q.Name()))
 }
 
 func (q *QwenCode) Status() ToolStatus {

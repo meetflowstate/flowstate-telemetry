@@ -163,8 +163,8 @@ func isSymlink(t *testing.T, path string) bool {
 }
 
 // Jamf's merge follows a symlinked settings.json (dotfiles) and keeps the
-// link, tightens a group/world-readable file, and refuses a link that leads
-// to a file the user does not own.
+// link, tightens a group/world-readable file, and skips (warns, exit 0) a
+// link that leads to a file the user does not own.
 func TestJamf_MergeClaudeFollowsOwnSymlink(t *testing.T) {
 	py := needPython(t)
 	out := generate(t, func(b *bytes.Buffer) error {
@@ -207,28 +207,79 @@ func TestJamf_MergeClaudeFollowsOwnSymlink(t *testing.T) {
 		t.Errorf("mode = %o, want 0600 (tightened from 0644)", m)
 	}
 
-	// A link to a file this user does not own (root's) is refused.
+	// A link to a file this user does not own (root's) is skipped with a
+	// warning: not an error, so the policy run goes on.
 	if os.Getuid() != 0 {
 		other := filepath.Join(home, ".claude", "other.json")
 		if err := os.Symlink("/etc/hosts", other); err != nil {
 			t.Fatal(err)
 		}
+		before := mustRead(t, "/etc/hosts")
 		b, err := run(other)
-		if err == nil || !strings.Contains(string(b), "not a file this user owns") {
-			t.Fatalf("link to /etc/hosts not refused: %v\n%s", err, b)
+		if err != nil || !strings.Contains(string(b), "warning:") || !strings.Contains(string(b), "not a file this user owns") {
+			t.Fatalf("link to /etc/hosts: want a warning and exit 0, got %v\n%s", err, b)
+		}
+		if mustRead(t, "/etc/hosts") != before || !isSymlink(t, other) {
+			t.Fatal("link to /etc/hosts changed")
 		}
 	}
 }
 
-// configureUser runs Jamf's configure_user for home with no python3 (the
-// fallback heredoc), feeding the endpoint and key on stdin.
-func configureUser(t *testing.T, script, home, key string) {
+// A settings.json linked to a file the user does not own is only a warning
+// in configure_user (with python3): the user is still configured and the
+// Cursor hooks step still runs.
+func TestJamf_ConfigureUserSkipsForeignSymlink(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root")
+	}
+	py := needPython(t)
+	out := generate(t, func(b *bytes.Buffer) error {
+		return GenerateJamf(b, config.Config{Endpoint: "https://otel.flowstate.host", Key: hostileKey})
+	})
+	merge := extractBetween(t, out, "read -r -d '' MERGE_CLAUDE <<'PYEOF' || true\n", "\nPYEOF\n")
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if err := os.Symlink("/etc/hosts", settings); err != nil {
+		t.Fatal(err)
+	}
+	b, err := runConfigureUser(t, out, home, py, merge, hostileKey)
+	if err != nil {
+		t.Fatalf("configure_user failed on a foreign symlink: %v\n%s", err, b)
+	}
+	if !strings.Contains(string(b), "warning:") {
+		t.Errorf("no warning printed:\n%s", b)
+	}
+	if !isSymlink(t, settings) {
+		t.Error("settings.json symlink replaced")
+	}
+	if fi, err := os.Stat(filepath.Join(home, ".cursor", "hooks")); err != nil || !fi.IsDir() {
+		t.Errorf("Cursor hooks step skipped: %v", err)
+	}
+}
+
+// runConfigureUser runs Jamf's configure_user for home with the given
+// python3 and merge script ("" for none), feeding the endpoint and key on
+// stdin.
+func runConfigureUser(t *testing.T, script, home, python, merge, key string) ([]byte, error) {
 	t.Helper()
 	fn := extractBetween(t, script, "configure_user() {", "\n}\n\n# Configure each user")
-	cmd := exec.Command("/bin/bash", "-c", "configure_user() {"+fn+"\n}\nconfigure_user \"$@\"", "x", home, "", "")
+	cmd := exec.Command("/bin/bash", "-c", "configure_user() {"+fn+"\n}\nconfigure_user \"$@\"", "x", home, python, merge)
 	cmd.Stdin = strings.NewReader("https://otel.flowstate.host\n" + key + "\n")
 	cmd.Dir = home
-	if b, err := cmd.CombinedOutput(); err != nil {
+	return cmd.CombinedOutput()
+}
+
+// configureUser runs Jamf's configure_user for home with no python3 (the
+// fallback heredoc).
+func configureUser(t *testing.T, script, home, key string) {
+	t.Helper()
+	if b, err := runConfigureUser(t, script, home, "", "", key); err != nil {
 		t.Fatalf("configure_user: %v\n%s", err, b)
 	}
 }

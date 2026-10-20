@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -115,7 +116,8 @@ func (o *OpenCodeTool) Install(cfg config.Config) error {
 func (o *OpenCodeTool) Remove() error {
 	opencodeCfg, err := readJSONFile(o.configPath())
 	if err != nil {
-		return err
+		// The shell block is removed even when the config file cannot be.
+		return errors.Join(err, shell.RemoveToolBlock(o.Name()))
 	}
 
 	o.removeLegacy(opencodeCfg)

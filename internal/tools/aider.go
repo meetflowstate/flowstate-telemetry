@@ -44,7 +44,7 @@ func (a *AiderTool) readConfig() (map[string]interface{}, error) {
 	}
 	var cfg map[string]interface{}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", unparseable(err))
 	}
 	if cfg == nil {
 		cfg = make(map[string]interface{})

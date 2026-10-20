@@ -89,25 +89,29 @@ fi
 # dotfiles repository) is followed: the temp file is written next to the real
 # file, which is replaced, so the link stays a link. That happens only when
 # the real file and its directory belong to this user (it runs as the user,
-# so a link can only lead to a file the user could already write). A new file
-# is 0600; an existing one keeps its mode, minus any group/other bits (it now
-# holds the key).
+# so a link can only lead to a file the user could already write); otherwise
+# it warns, leaves the file unchanged and exits 0, so the run goes on. A new
+# file is 0600; an existing one keeps its mode, minus any group/other bits (it
+# now holds the key).
 read -r -d '' MERGE_CLAUDE <<'PYEOF' || true
 import json, os, sys, tempfile
+def skip(msg):
+    sys.stderr.write('  warning: %s: not changed\n' % msg)
+    sys.exit(0)
 path = sys.argv[1]
 real = os.path.realpath(path)
 uid = os.getuid()
 try:
     st = os.stat(real)
     if st.st_uid != uid or not os.path.isfile(real):
-        sys.exit('  warning: %s resolves to %s, which is not a file this user owns: not changed' % (path, real))
+        skip('%s resolves to %s, which is not a file this user owns' % (path, real))
     with open(real) as f:
         s = json.load(f)
     mode = st.st_mode & 0o777 & ~0o077
 except FileNotFoundError:
     s, mode = {}, 0o600
 if os.stat(os.path.dirname(real)).st_uid != uid:
-    sys.exit('  warning: %s is in a directory this user does not own: not changed' % real)
+    skip('%s is in a directory this user does not own' % real)
 env = s.setdefault('env', {})
 env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
 env.update({

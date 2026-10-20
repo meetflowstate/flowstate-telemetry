@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -95,7 +96,7 @@ func (g *GeminiCLI) readSettings() (map[string]interface{}, error) {
 	}
 	var settings map[string]interface{}
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, fmt.Errorf("parsing settings: %w", err)
+		return nil, fmt.Errorf("parsing settings: %w", unparseable(err))
 	}
 	return settings, nil
 }
@@ -154,17 +155,16 @@ func (g *GeminiCLI) Install(cfg config.Config) error {
 }
 
 func (g *GeminiCLI) Remove() error {
+	// The shell block is removed even when the settings file cannot be.
+	var err error
 	if fileExists(g.settingsPath()) {
-		settings, err := g.readSettings()
-		if err != nil {
-			return err
-		}
-		delete(settings, "telemetry")
-		if err := g.writeSettings(settings); err != nil {
-			return err
+		var settings map[string]interface{}
+		if settings, err = g.readSettings(); err == nil {
+			delete(settings, "telemetry")
+			err = g.writeSettings(settings)
 		}
 	}
-	return shell.RemoveToolBlock(g.Name())
+	return errors.Join(err, shell.RemoveToolBlock(g.Name()))
 }
 
 func (g *GeminiCLI) Status() ToolStatus {

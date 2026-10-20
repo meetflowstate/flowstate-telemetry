@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -12,6 +13,21 @@ import (
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
+
+// ErrUnparseable matches (errors.Is) an error from a settings or config file
+// that exists but cannot be parsed, so nothing in it can be read or removed.
+var ErrUnparseable = errors.New("unparseable file")
+
+// unparseableError wraps a parse error so that it matches ErrUnparseable
+// while keeping the parser's message.
+type unparseableError struct{ err error }
+
+func (e *unparseableError) Error() string        { return e.err.Error() }
+func (e *unparseableError) Unwrap() error        { return e.err }
+func (e *unparseableError) Is(target error) bool { return target == ErrUnparseable }
+
+// unparseable marks err (from a parser) as matching ErrUnparseable.
+func unparseable(err error) error { return &unparseableError{err} }
 
 // readJSONFile reads a JSON object from path; a missing file is an empty map.
 func readJSONFile(path string) (map[string]interface{}, error) {
@@ -24,7 +40,7 @@ func readJSONFile(path string) (map[string]interface{}, error) {
 	}
 	var out map[string]interface{}
 	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", filepath.Base(path), err)
+		return nil, fmt.Errorf("parsing %s: %w", filepath.Base(path), unparseable(err))
 	}
 	if out == nil {
 		out = make(map[string]interface{})

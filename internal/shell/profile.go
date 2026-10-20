@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -35,9 +36,58 @@ func ProfilePath() string {
 // user's shell profile, surrounded by marker comments for easy identification
 // and removal.
 func WriteEnvVars(cfg config.Config, dryRun bool) error {
-	profilePath := ProfilePath()
+	return writeBlock(markerStart, markerEnd, buildEnvBlock(cfg), dryRun)
+}
 
-	block := buildEnvBlock(cfg)
+// RemoveEnvVars removes the Flowstate telemetry block, and every tool block
+// written by WriteToolBlock, from the shell profile.
+func RemoveEnvVars() error {
+	if err := removeBlock(markerStart, markerEnd); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(ProfilePath())
+	if err != nil {
+		return nil
+	}
+	for _, m := range toolMarkerPattern.FindAllStringSubmatch(string(data), -1) {
+		if err := RemoveToolBlock(m[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var toolMarkerPattern = regexp.MustCompile(`(?m)^# --- Flowstate Telemetry: ([A-Za-z0-9_.-]+) ---$`)
+
+// WriteToolBlock writes a block owned by one tool (for example a wrapper
+// function that scopes OTEL_* variables to a single command) to the shell
+// profile, replacing any previous block for that tool.
+func WriteToolBlock(tool string, lines []string, dryRun bool) error {
+	start, end := toolMarkers(tool)
+	block := strings.Join(append(append([]string{start}, lines...), end), "\n")
+	return writeBlock(start, end, block, dryRun)
+}
+
+// RemoveToolBlock removes the block written by WriteToolBlock for tool.
+func RemoveToolBlock(tool string) error {
+	start, end := toolMarkers(tool)
+	return removeBlock(start, end)
+}
+
+// HasToolBlock reports whether the shell profile contains tool's block.
+func HasToolBlock(tool string) bool {
+	start, _ := toolMarkers(tool)
+	data, err := os.ReadFile(ProfilePath())
+	return err == nil && strings.Contains(string(data), start)
+}
+
+func toolMarkers(tool string) (string, string) {
+	return fmt.Sprintf("# --- Flowstate Telemetry: %s ---", tool),
+		fmt.Sprintf("# --- End Flowstate Telemetry: %s ---", tool)
+}
+
+func writeBlock(start, end, block string, dryRun bool) error {
+	profilePath := ProfilePath()
 
 	if dryRun {
 		fmt.Printf("[dry-run] Would append to %s:\n%s\n", profilePath, block)
@@ -49,12 +99,8 @@ func WriteEnvVars(cfg config.Config, dryRun bool) error {
 		return fmt.Errorf("reading profile: %w", err)
 	}
 
-	content := string(existing)
+	content := removeExistingBlock(string(existing), start, end)
 
-	// Remove existing Flowstate block if present
-	content = removeExistingBlock(content)
-
-	// Append new block
 	if !strings.HasSuffix(content, "\n") && len(content) > 0 {
 		content += "\n"
 	}
@@ -63,8 +109,7 @@ func WriteEnvVars(cfg config.Config, dryRun bool) error {
 	return os.WriteFile(profilePath, []byte(content), 0644)
 }
 
-// RemoveEnvVars removes the Flowstate telemetry block from the shell profile.
-func RemoveEnvVars() error {
+func removeBlock(start, end string) error {
 	profilePath := ProfilePath()
 
 	data, err := os.ReadFile(profilePath)
@@ -75,48 +120,64 @@ func RemoveEnvVars() error {
 		return fmt.Errorf("reading profile: %w", err)
 	}
 
-	content := removeExistingBlock(string(data))
+	content := removeExistingBlock(string(data), start, end)
 
 	return os.WriteFile(profilePath, []byte(content), 0644)
 }
 
+// buildEnvBlock renders the shared profile block.
+//
+// OTEL_EXPORTER_OTLP_HEADERS is exported because Copilot Chat (and the
+// Gemini/Qwen CLIs, as a fallback) can only take OTLP headers from the
+// environment. Every Flowstate-configured tool uses the same key, so sharing
+// it is safe for them; tools with their own header config (Claude Code,
+// Codex, OpenCode) override it.
+//
+// OTEL_RESOURCE_ATTRIBUTES deliberately carries no service.name: each tool
+// sets its own, and overriding it would make every tool look the same.
 func buildEnvBlock(cfg config.Config) string {
 	var lines []string
 	lines = append(lines, markerStart)
-	lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_ENDPOINT=%q", cfg.Endpoint))
+	lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_ENDPOINT=%q", cfg.BaseEndpoint()))
 
 	if cfg.Key != "" {
 		lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_KEY=%q", cfg.Key))
+		lines = append(lines, fmt.Sprintf("export OTEL_EXPORTER_OTLP_HEADERS=%q", cfg.HeadersEnv()))
 	}
 
-	attrs := []string{
-		fmt.Sprintf("service.name=flowstate-telemetry"),
+	if attrs := ResourceAttributes(cfg); attrs != "" {
+		lines = append(lines, fmt.Sprintf("export OTEL_RESOURCE_ATTRIBUTES=%q", attrs))
 	}
+	lines = append(lines, markerEnd)
+
+	return strings.Join(lines, "\n")
+}
+
+// ResourceAttributes returns the OTEL_RESOURCE_ATTRIBUTES value (Flowstate
+// team and email only), or "" when neither is set.
+func ResourceAttributes(cfg config.Config) string {
+	var attrs []string
 	if cfg.TeamID != "" {
 		attrs = append(attrs, fmt.Sprintf("flowstate.team_id=%s", cfg.TeamID))
 	}
 	if cfg.Email != "" {
 		attrs = append(attrs, fmt.Sprintf("flowstate.email=%s", cfg.Email))
 	}
-
-	lines = append(lines, fmt.Sprintf("export OTEL_RESOURCE_ATTRIBUTES=%q", strings.Join(attrs, ",")))
-	lines = append(lines, markerEnd)
-
-	return strings.Join(lines, "\n")
+	return strings.Join(attrs, ",")
 }
 
-func removeExistingBlock(content string) string {
-	startIdx := strings.Index(content, markerStart)
+func removeExistingBlock(content, start, end string) string {
+	startIdx := strings.Index(content, start)
 	if startIdx == -1 {
 		return content
 	}
 
-	endIdx := strings.Index(content, markerEnd)
-	if endIdx == -1 {
+	rel := strings.Index(content[startIdx:], end)
+	if rel == -1 {
 		return content
 	}
 
-	endIdx += len(markerEnd)
+	endIdx := startIdx + rel + len(end)
 
 	// Also remove trailing newline after the block
 	if endIdx < len(content) && content[endIdx] == '\n' {
@@ -129,4 +190,18 @@ func removeExistingBlock(content string) string {
 	}
 
 	return content[:startIdx] + content[endIdx:]
+}
+
+// WrapperFunction renders a shell function that runs the real command with
+// extra environment assignments, so OTEL_* variables reach that one tool and
+// not every OpenTelemetry SDK started from the shell. zsh and bash use the
+// `function` keyword so an existing alias of the same name cannot break the
+// profile; other shells get the POSIX form.
+func WrapperFunction(command string, assignments []string) string {
+	body := fmt.Sprintf("%s command %s \"$@\"; }", strings.Join(assignments, " "), command)
+	p := ProfilePath()
+	if strings.HasSuffix(p, ".zshrc") || strings.HasSuffix(p, ".bashrc") {
+		return fmt.Sprintf("function %s { %s", command, body)
+	}
+	return fmt.Sprintf("%s() { %s", command, body)
 }

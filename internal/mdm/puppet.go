@@ -24,7 +24,7 @@ class flowstate_telemetry (
     content => @("ENVEOF")
       export FLOWSTATE_OTLP_ENDPOINT="${endpoint}"
       export FLOWSTATE_OTLP_KEY="${key}"
-      export OTEL_RESOURCE_ATTRIBUTES="service.name=flowstate-telemetry"
+      export OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${key}"
       | ENVEOF
   }
 
@@ -57,7 +57,7 @@ class flowstate_telemetry (
               "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
               "OTEL_EXPORTER_OTLP_ENDPOINT": "${endpoint}",
               "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=${key}",
-              "OTEL_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+              "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
               "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
               "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
             }
@@ -82,8 +82,9 @@ class flowstate_telemetry (
         content => @("VSCODEEOF")
           {
             "github.copilot.chat.otel.enabled": true,
-            "github.copilot.chat.otel.exporterType": "otlp-grpc",
-            "github.copilot.chat.otel.otlpEndpoint": "${endpoint}"
+            "github.copilot.chat.otel.exporterType": "otlp-http",
+            "github.copilot.chat.otel.otlpEndpoint": "${endpoint}",
+            "github.copilot.chat.otel.headers": { "x-flowstate-key": "${key}" }
           }
           | VSCODEEOF
         require => Exec["check-vscode-${username}"],
@@ -107,7 +108,7 @@ class flowstate_telemetry (
               "enabled": true,
               "target": "local",
               "otlpEndpoint": "${endpoint}",
-              "otlpProtocol": "grpc",
+              "otlpProtocol": "http",
               "logPrompts": false
             }
           }

@@ -1,0 +1,13 @@
+{
+  "telemetry": {
+    "enabled": true,
+    "logPrompts": false,
+    "otlpEndpoint": "https://otel.flowstate.host",
+    "otlpHeaders": {
+      "x-flowstate-key": "fs_test_key"
+    },
+    "otlpProtocol": "http",
+    "target": "local"
+  },
+  "theme": "dark"
+}

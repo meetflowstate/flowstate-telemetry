@@ -11,6 +11,11 @@ import (
 )
 
 // QwenCode configures telemetry for Alibaba's Qwen Code CLI.
+//
+// Same telemetry block as Gemini CLI (it is a fork), except Qwen has no
+// header setting: the key reaches it only through OTEL_EXPORTER_OTLP_HEADERS
+// from the shell profile block. With otlpProtocol "http" it appends
+// /v1/{logs,metrics,traces} and sends OTLP/HTTP JSON.
 type QwenCode struct{}
 
 func (q *QwenCode) Name() string { return "qwen-code" }
@@ -66,16 +71,13 @@ func (q *QwenCode) Install(cfg config.Config) error {
 		return err
 	}
 
+	// logPrompts defaults to true in Qwen, so it is always written.
 	telemetry := map[string]interface{}{
 		"enabled":      true,
 		"target":       "local",
-		"otlpEndpoint": cfg.Endpoint,
-		"otlpProtocol": "grpc",
-		"logPrompts":   false,
-	}
-
-	if cfg.Prompts {
-		telemetry["logPrompts"] = true
+		"otlpEndpoint": cfg.BaseEndpoint(),
+		"otlpProtocol": "http",
+		"logPrompts":   cfg.Prompts,
 	}
 
 	settings["telemetry"] = telemetry
@@ -148,10 +150,5 @@ func (q *QwenCode) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: "telemetry not enabled"}
 	}
 
-	result := VerifyResult{OK: true, Message: "settings.json present · telemetry enabled"}
-	if logPrompts, ok := telemetry["logPrompts"].(bool); !ok || !logPrompts {
-		result.Warning = "logPrompts not enabled (re-run with --prompts)"
-	}
-
-	return result
+	return verifyGeminiStyle(telemetry, cfg, "QWEN_TELEMETRY_OTLP_ENDPOINT", false)
 }

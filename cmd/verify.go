@@ -50,6 +50,9 @@ func runVerify(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\u2717  %-16s %s\n", t.Name(), result.Message)
 			hasErrors = true
 		}
+		for _, note := range result.Notes {
+			fmt.Printf("   %-16s note: %s\n", "", note)
+		}
 	}
 
 	if hasErrors || hasWarnings {

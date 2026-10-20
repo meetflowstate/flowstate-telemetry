@@ -31,7 +31,14 @@ const ansibleTemplate = `---
       loop:
         - { key: "FLOWSTATE_OTLP_ENDPOINT", value: "{{ "{{ flowstate_endpoint }}" }}" }
         - { key: "FLOWSTATE_OTLP_KEY", value: "{{ "{{ flowstate_key }}" }}" }
-        - { key: "OTEL_RESOURCE_ATTRIBUTES", value: "service.name=flowstate-telemetry" }
+        - { key: "OTEL_EXPORTER_OTLP_HEADERS", value: "x-flowstate-key={{ "{{ flowstate_key }}" }}" }
+
+    - name: Remove the service.name override written by earlier versions
+      become: true
+      lineinfile:
+        path: /etc/environment
+        regexp: "^OTEL_RESOURCE_ATTRIBUTES=service.name=flowstate-telemetry$"
+        state: absent
 
     - name: Ensure Claude Code config directory exists
       file:
@@ -51,7 +58,7 @@ const ansibleTemplate = `---
               "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
               "OTEL_EXPORTER_OTLP_ENDPOINT": "{{ "{{ flowstate_endpoint }}" }}",
               "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key={{ "{{ flowstate_key }}" }}",
-              "OTEL_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+              "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
               "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
               "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
             }
@@ -78,8 +85,9 @@ const ansibleTemplate = `---
         content: |
           {
             "github.copilot.chat.otel.enabled": true,
-            "github.copilot.chat.otel.exporterType": "otlp-grpc",
-            "github.copilot.chat.otel.otlpEndpoint": "{{ "{{ flowstate_endpoint }}" }}"
+            "github.copilot.chat.otel.exporterType": "otlp-http",
+            "github.copilot.chat.otel.otlpEndpoint": "{{ "{{ flowstate_endpoint }}" }}",
+            "github.copilot.chat.otel.headers": { "x-flowstate-key": "{{ "{{ flowstate_key }}" }}" }
           }
         mode: "0644"
         force: false
@@ -101,7 +109,7 @@ const ansibleTemplate = `---
               "enabled": true,
               "target": "local",
               "otlpEndpoint": "{{ "{{ flowstate_endpoint }}" }}",
-              "otlpProtocol": "grpc",
+              "otlpProtocol": "http",
               "logPrompts": false
             }
           }
@@ -116,7 +124,7 @@ const ansibleTemplate = `---
         block: |
           export FLOWSTATE_OTLP_ENDPOINT="{{ "{{ flowstate_endpoint }}" }}"
           export FLOWSTATE_OTLP_KEY="{{ "{{ flowstate_key }}" }}"
-          export OTEL_RESOURCE_ATTRIBUTES="service.name=flowstate-telemetry"
+          export OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key={{ "{{ flowstate_key }}" }}"
         create: true
 `
 

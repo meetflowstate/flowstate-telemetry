@@ -1,0 +1,15 @@
+# my codex config
+model = "gpt-5-codex" # inline comment
+
+[analytics]
+enabled = false
+
+[profiles.fast]
+model = "gpt-5-mini"
+
+[otel]
+environment = "production"
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "https://otel.flowstate.host/v1/logs", protocol = "binary", headers = { "x-flowstate-key" = "fs_test_key" } } }
+metrics_exporter = { otlp-http = { endpoint = "https://otel.flowstate.host/v1/metrics", protocol = "binary", headers = { "x-flowstate-key" = "fs_test_key" } } }
+trace_exporter = { otlp-http = { endpoint = "https://otel.flowstate.host/v1/traces", protocol = "binary", headers = { "x-flowstate-key" = "fs_test_key" } } }

@@ -22,7 +22,12 @@ Write-Host "Configuring Flowstate Telemetry..."
 # Set system-wide environment variables
 [System.Environment]::SetEnvironmentVariable("FLOWSTATE_OTLP_ENDPOINT", $Endpoint, "Machine")
 [System.Environment]::SetEnvironmentVariable("FLOWSTATE_OTLP_KEY", $Key, "Machine")
-[System.Environment]::SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", "service.name=flowstate-telemetry", "Machine")
+# OTLP headers for tools that only read them from the environment
+[System.Environment]::SetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS", "x-flowstate-key=$Key", "Machine")
+# Earlier versions forced service.name for every tool; remove that value
+if ([System.Environment]::GetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", "Machine") -eq "service.name=flowstate-telemetry") {
+    [System.Environment]::SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", $null, "Machine")
+}
 
 # Also set for current user session
 $env:FLOWSTATE_OTLP_ENDPOINT = $Endpoint
@@ -43,7 +48,7 @@ $envBlock = @{
     "OTEL_EXPORTER_OTLP_PROTOCOL" = "http/protobuf"
     "OTEL_EXPORTER_OTLP_ENDPOINT" = $Endpoint
     "OTEL_EXPORTER_OTLP_HEADERS" = "x-flowstate-key=$Key"
-    "OTEL_METRICS_TEMPORALITY_PREFERENCE" = "cumulative"
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE" = "delta"
     "OTEL_METRICS_INCLUDE_SESSION_ID" = "true"
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID" = "true"
 }
@@ -53,6 +58,7 @@ if (Test-Path $ClaudeSettings) {
     if (-not $settings.env) {
         $settings | Add-Member -NotePropertyName "env" -NotePropertyValue @{}
     }
+    $settings.env.PSObject.Properties.Remove("OTEL_METRICS_TEMPORALITY_PREFERENCE")
     foreach ($kv in $envBlock.GetEnumerator()) {
         $settings.env | Add-Member -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
     }
@@ -67,8 +73,9 @@ $VSCodeSettings = Join-Path $env:APPDATA "Code\User\settings.json"
 if (Test-Path $VSCodeSettings) {
     $vsSettings = Get-Content $VSCodeSettings -Raw | ConvertFrom-Json
     $vsSettings | Add-Member -NotePropertyName "github.copilot.chat.otel.enabled" -NotePropertyValue $true -Force
-    $vsSettings | Add-Member -NotePropertyName "github.copilot.chat.otel.exporterType" -NotePropertyValue "otlp-grpc" -Force
+    $vsSettings | Add-Member -NotePropertyName "github.copilot.chat.otel.exporterType" -NotePropertyValue "otlp-http" -Force
     $vsSettings | Add-Member -NotePropertyName "github.copilot.chat.otel.otlpEndpoint" -NotePropertyValue $Endpoint -Force
+    $vsSettings | Add-Member -NotePropertyName "github.copilot.chat.otel.headers" -NotePropertyValue @{ "x-flowstate-key" = $Key } -Force
     $vsSettings | ConvertTo-Json -Depth 10 | Set-Content $VSCodeSettings -Encoding UTF8
     Write-Host "  Configured: VS Code Copilot Chat"
 }

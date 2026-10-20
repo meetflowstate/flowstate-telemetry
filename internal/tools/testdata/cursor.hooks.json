@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "afterFileEdit": [
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh afterFileEdit"
+      }
+    ],
+    "afterTabFileEdit": [
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh afterTabFileEdit"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh beforeSubmitPrompt"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh sessionEnd"
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh sessionStart"
+      }
+    ],
+    "stop": [
+      {
+        "command": "./my-stop.sh"
+      },
+      {
+        "command": "$HOME/.cursor/hooks/flowstate.sh stop"
+      }
+    ]
+  },
+  "version": 1
+}

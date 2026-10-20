@@ -1,0 +1,33 @@
+{
+  "flowstate": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "$HOME/.gemini/config/flowstate-antigravity.sh PostToolUse",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "$HOME/.gemini/config/flowstate-antigravity.sh Stop",
+        "timeout": 10,
+        "type": "command"
+      }
+    ],
+    "enabled": true
+  },
+  "mine": {
+    "Stop": [
+      {
+        "command": "echo hi",
+        "type": "command"
+      }
+    ],
+    "enabled": true
+  }
+}

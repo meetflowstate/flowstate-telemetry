@@ -15,6 +15,7 @@ var (
 	flagInstallAll     bool
 	flagInstallDryRun  bool
 	flagInstallPrompts bool
+	flagInstallGUIEnv  bool
 )
 
 var installCmd = &cobra.Command{
@@ -23,7 +24,16 @@ var installCmd = &cobra.Command{
 	Long: `Install configures telemetry for AI coding tools on this machine.
 
 Use --all to configure every detected tool, or --tool <name> to target
-a specific tool. Use --dry-run to preview changes without writing files.`,
+a specific tool. Use --dry-run to preview changes without writing files.
+
+Every tool sends OTLP over HTTP (protobuf or JSON) to the Flowstate
+receiver; gRPC is never configured.
+
+On macOS, apps opened from the Dock (VS Code, Cursor, Windsurf) do not read
+the shell profile. --gui-env also publishes FLOWSTATE_OTLP_ENDPOINT,
+FLOWSTATE_OTLP_KEY and OTEL_EXPORTER_OTLP_HEADERS with 'launchctl setenv'
+and installs a LaunchAgent that repeats it at login. Those variables are
+then visible to every GUI app you run, so it is opt-in.`,
 	RunE: runInstall,
 }
 
@@ -32,6 +42,7 @@ func init() {
 	installCmd.Flags().BoolVar(&flagInstallAll, "all", false, "Install for all detected tools")
 	installCmd.Flags().BoolVar(&flagInstallDryRun, "dry-run", false, "Show what would be changed without writing")
 	installCmd.Flags().BoolVar(&flagInstallPrompts, "prompts", false, "Enable prompt/content capture where supported")
+	installCmd.Flags().BoolVar(&flagInstallGUIEnv, "gui-env", false, "macOS: also expose the env vars to Dock-launched apps via launchctl setenv")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -44,6 +55,11 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	cfg.Prompts = flagInstallPrompts
 	cfg.DryRun = flagInstallDryRun
 	cfg.Verbose = flagVerbose
+	cfg.GUIEnv = flagInstallGUIEnv
+
+	if cfg.GUIEnv && !shell.GUIEnvSupported() {
+		return fmt.Errorf("--gui-env is only supported on macOS")
+	}
 
 	if cfg.Key == "" && !cfg.DryRun {
 		fmt.Fprintln(os.Stderr, "Warning: no API key set. Use --key or FLOWSTATE_OTLP_KEY env var.")
@@ -99,6 +115,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  [dry-run] Shell env vars would be written to %s\n", profilePath)
 		} else {
 			fmt.Printf("  Shell env vars written to %s\n", profilePath)
+		}
+	}
+
+	if cfg.GUIEnv {
+		if err := shell.InstallGUIEnv(cfg, cfg.DryRun); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not set GUI environment: %v\n", err)
+		} else if !cfg.DryRun {
+			fmt.Printf("  GUI env vars set via launchctl (LaunchAgent %s); restart GUI apps to pick them up\n", shell.GUIEnvAgentPath())
 		}
 	}
 

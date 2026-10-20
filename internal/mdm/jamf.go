@@ -19,16 +19,26 @@ KEY="{{ .Key }}"
 
 echo "==> Configuring Flowstate telemetry for all users..."
 
-# System-wide environment variables
+# System-wide environment variables. The receiver is OTLP/HTTP only (no
+# gRPC). OTEL_EXPORTER_OTLP_HEADERS carries the key for tools that only read
+# headers from the environment. No service.name: each tool sets its own.
 cat > /etc/flowstate-telemetry.env <<'ENVEOF'
 FLOWSTATE_OTLP_ENDPOINT="{{ .Endpoint }}"
 FLOWSTATE_OTLP_KEY="{{ .Key }}"
-OTEL_RESOURCE_ATTRIBUTES="service.name=flowstate-telemetry"
+OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key={{ .Key }}"
 ENVEOF
 chmod 644 /etc/flowstate-telemetry.env
 
-# LaunchDaemon to source env vars on login
-cat > /Library/LaunchDaemons/inc.flowstate.telemetry.env.plist <<'PLISTEOF'
+# Earlier versions installed a LaunchDaemon, whose launchctl setenv lands in
+# the system domain and never reaches users' GUI sessions.
+if [ -f /Library/LaunchDaemons/inc.flowstate.telemetry.env.plist ]; then
+    launchctl bootout system/inc.flowstate.telemetry.env 2>/dev/null || true
+    rm -f /Library/LaunchDaemons/inc.flowstate.telemetry.env.plist
+fi
+
+# LaunchAgent (runs in each user's session at login) so apps opened from the
+# Dock (VS Code, Cursor, Windsurf) see the variables.
+cat > /Library/LaunchAgents/inc.flowstate.telemetry.env.plist <<'PLISTEOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -39,13 +49,14 @@ cat > /Library/LaunchDaemons/inc.flowstate.telemetry.env.plist <<'PLISTEOF'
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>source /etc/flowstate-telemetry.env; launchctl setenv FLOWSTATE_OTLP_ENDPOINT "$FLOWSTATE_OTLP_ENDPOINT"; launchctl setenv FLOWSTATE_OTLP_KEY "$FLOWSTATE_OTLP_KEY"</string>
+        <string>source /etc/flowstate-telemetry.env; launchctl setenv FLOWSTATE_OTLP_ENDPOINT "$FLOWSTATE_OTLP_ENDPOINT"; launchctl setenv FLOWSTATE_OTLP_KEY "$FLOWSTATE_OTLP_KEY"; launchctl setenv OTEL_EXPORTER_OTLP_HEADERS "$OTEL_EXPORTER_OTLP_HEADERS"</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
 </dict>
 </plist>
 PLISTEOF
+chmod 644 /Library/LaunchAgents/inc.flowstate.telemetry.env.plist
 
 # Configure Claude Code for each user
 for HOMEDIR in /Users/*; do
@@ -64,14 +75,16 @@ for HOMEDIR in /Users/*; do
 import json, sys
 with open('$SETTINGS') as f:
     s = json.load(f)
-s.setdefault('env', {}).update({
+env = s.setdefault('env', {})
+env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
+env.update({
     'CLAUDE_CODE_ENABLE_TELEMETRY': '1',
     'OTEL_METRICS_EXPORTER': 'otlp',
     'OTEL_LOGS_EXPORTER': 'otlp',
     'OTEL_EXPORTER_OTLP_PROTOCOL': 'http/protobuf',
     'OTEL_EXPORTER_OTLP_ENDPOINT': '$ENDPOINT',
     'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=$KEY',
-    'OTEL_METRICS_TEMPORALITY_PREFERENCE': 'cumulative',
+    'OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE': 'delta',
     'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
     'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true'
 })
@@ -88,7 +101,7 @@ with open('$SETTINGS', 'w') as f:
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "$ENDPOINT",
     "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=$KEY",
-    "OTEL_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
     "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
   }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/meetflowstate/flowstate-telemetry/internal/hooks"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 	"github.com/meetflowstate/flowstate-telemetry/internal/tools"
 	"github.com/spf13/cobra"
@@ -75,6 +76,12 @@ func runRemove(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "  Warning: could not clean shell profile: %v\n", err)
 		} else {
 			fmt.Printf("  Shell env vars removed from %s\n", shell.ProfilePath())
+		}
+		if err := hooks.RemoveEnvFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not remove %s: %v\n", hooks.EnvFilePath(), err)
+		}
+		if err := shell.RemoveGUIEnv(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not remove GUI env vars: %v\n", err)
 		}
 	}
 

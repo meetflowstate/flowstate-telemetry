@@ -1,0 +1,9 @@
+{
+  "telemetry": {
+    "enabled": true,
+    "logPrompts": false,
+    "otlpEndpoint": "https://otel.flowstate.host",
+    "otlpProtocol": "http",
+    "target": "local"
+  }
+}

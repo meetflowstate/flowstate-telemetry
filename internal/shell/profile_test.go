@@ -30,7 +30,7 @@ func TestBuildEnvBlock_Golden(t *testing.T) {
 		Email:    "dev@example.com",
 	}
 	want := `# --- Flowstate Telemetry ---
-export FLOWSTATE_OTLP_ENDPOINT="https://otel.flowstate.host"
+export FLOWSTATE_OTLP_ENDPOINT='https://otel.flowstate.host'
 # FLOWSTATE_OTLP_KEY is read from the env file (mode 0600), not stored here.
 ` + KeyLoader(hooks.EnvFilePath()) + `
 # --- End Flowstate Telemetry ---`
@@ -233,6 +233,17 @@ func TestInstallGUIEnv(t *testing.T) {
 	}
 	if st, _ := os.Stat(GUIEnvAgentPath()); st.Mode().Perm() != 0600 {
 		t.Fatalf("plist mode = %v, want 0600", st.Mode().Perm())
+	}
+	// A plist an earlier release left group/world-readable is tightened.
+	if err := os.Chmod(GUIEnvAgentPath(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	if err := InstallGUIEnv(cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(GUIEnvAgentPath()); st.Mode().Perm() != 0600 {
+		t.Fatalf("existing plist mode = %v, want 0600", st.Mode().Perm())
 	}
 
 	calls = nil
@@ -466,5 +477,32 @@ func assertUserLines(t *testing.T, got, user string) {
 			t.Fatalf("user line %q missing or joined to another line:\n%s", want, got)
 		}
 		i++
+	}
+}
+
+// The endpoint is single-quoted in the profile: should a hostile value ever
+// get past validation, $(...) and backticks in it are never run at shell
+// start.
+func TestBuildEnvBlock_EndpointIsLiteral(t *testing.T) {
+	home := filepath.Dir(sandbox(t))
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not installed")
+	}
+	hostile := "https://x.example/$(touch pwned)`touch pwned2`'q\"z"
+	block := buildEnvBlock(config.Config{Endpoint: hostile})
+	cmd := exec.Command(bash, "-c", block+"\nprintf %s \"$FLOWSTATE_OTLP_ENDPOINT\"")
+	cmd.Dir = home
+	got, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != hostile {
+		t.Errorf("endpoint = %q, want %q", got, hostile)
+	}
+	for _, f := range []string{"pwned", "pwned2"} {
+		if _, err := os.Stat(filepath.Join(home, f)); err == nil {
+			t.Errorf("%s created: the endpoint was executed", f)
+		}
 	}
 }

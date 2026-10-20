@@ -40,7 +40,12 @@ On macOS, --gui-env also publishes FLOWSTATE_OTLP_ENDPOINT and
 FLOWSTATE_OTLP_KEY with 'launchctl setenv' and installs a LaunchAgent that
 repeats it at login. Hook scripts already read ~/.config/flowstate-telemetry/env,
 so this is rarely needed; the variables are visible to every GUI app you run,
-so it is opt-in.`,
+so it is opt-in. It also passes the key on a command line ('launchctl setenv'
+now, and the LaunchAgent's 'sh -c' at every login), where other processes can
+briefly read it with ps.
+
+The endpoint must be an https URL (http only for localhost); the key, team id
+and e-mail may not contain control characters.`,
 	RunE: runInstall,
 }
 
@@ -63,6 +68,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	cfg.DryRun = flagInstallDryRun
 	cfg.Verbose = flagVerbose
 	cfg.GUIEnv = flagInstallGUIEnv
+	if err := cfg.Validate(true); err != nil {
+		return err
+	}
 
 	if cfg.GUIEnv && !shell.GUIEnvSupported() {
 		return fmt.Errorf("--gui-env is only supported on macOS")

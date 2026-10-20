@@ -24,15 +24,28 @@ const puppetTemplate = `# Flowstate Telemetry — Puppet Manifest
 # and Gemini CLI gets it from a "gemini" wrapper function; no profile stores
 # the key.
 #
-# The env file, Claude Code's settings.json (merged: the user's own settings
-# are kept) and the profile block are written by a script Puppet runs AS each
+# Every file under a home directory (the env file, the shell profile block,
+# and Claude Code's, VS Code's and Gemini CLI's settings.json, merged so the
+# user's own settings are kept) is written by a script Puppet runs AS each
 # user, so root never writes through a path the user controls. The key
-# reaches it in the environment, never on a command line.
+# reaches it in the environment, never on a command line. The script needs a
+# python3 that runs without prompting; without one (macOS without the Command
+# Line Tools or Homebrew python) it is skipped with a warning.
 
 class flowstate_telemetry (
   String $endpoint = {{ pp .Endpoint }},
   String $key      = {{ pp .Key }},
 ) {
+
+  # Both may come from Hiera. A newline would split the env file and the
+  # exec environment; quotes or shell characters in the endpoint would reach
+  # the shell profile.
+  unless $endpoint =~ /\Ahttps:\/\/[A-Za-z0-9._~:\/%\[\]-]+\z/ {
+    fail('flowstate_telemetry: $endpoint must be an https URL without quotes, spaces or shell characters')
+  }
+  if $key =~ /[[:cntrl:]]/ {
+    fail('flowstate_telemetry: $key contains a control character')
+  }
 
   # Earlier versions exported the key (and OTEL_EXPORTER_OTLP_HEADERS) to
   # every login shell from a world-readable file.
@@ -53,20 +66,52 @@ class flowstate_telemetry (
     require => Exec['flowstate-telemetry-dir'],
   }
 
+  # Finds a python3 that runs without prompting (/usr/bin/python3 on macOS is
+  # only a stub until the Command Line Tools are installed) and runs
+  # configure-user.py with it. --has-python only reports (exit 3: none).
+  file { '/opt/flowstate-telemetry/configure-user':
+    ensure  => file,
+    owner   => 'root',
+    mode    => '0755',
+    content => @(SHEOF),
+      #!/bin/sh
+      PY=""
+      if [ "$(uname -s)" = Darwin ]; then
+          if /usr/bin/xcode-select -p >/dev/null 2>&1 && [ -x /usr/bin/python3 ]; then
+              PY=/usr/bin/python3
+          else
+              for c in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+                  if [ -x "$c" ]; then PY="$c"; break; fi
+              done
+          fi
+      else
+          PY=$(command -v python3 2>/dev/null || true)
+      fi
+      if [ -z "$PY" ] || ! "$PY" -c 'import sys' >/dev/null 2>&1; then
+          echo "flowstate-telemetry: no usable python3 (macOS: install the Command Line Tools); user settings not configured" >&2
+          exit 3
+      fi
+      if [ "${1:-}" = --has-python ]; then exit 0; fi
+      exec "$PY" /opt/flowstate-telemetry/configure-user.py "$@"
+      | SHEOF
+    require => File['/opt/flowstate-telemetry'],
+  }
+
   # Per-user configuration, run as the user. With --check it changes nothing
   # and exits 1 when an update is needed (the exec's unless).
   file { '/opt/flowstate-telemetry/configure-user.py':
     ensure  => file,
     owner   => 'root',
-    mode    => '0755',
+    mode    => '0644',
     content => @(PYEOF),
-      import json, os, re, sys, tempfile
+      import json, os, re, shutil, sys, tempfile
 
       home = os.environ['HOME']
       endpoint = os.environ['FS_ENDPOINT']
       key = os.environ['FS_KEY']
       rc_files = os.environ.get('FS_RC_FILES', '.bashrc').split()
       check = '--check' in sys.argv[1:]
+      uid = os.getuid()
 
       BEGIN, END = '# BEGIN Flowstate Telemetry', '# END Flowstate Telemetry'
       BLOCK = re.compile('^' + re.escape(BEGIN) + r'\n.*?^' + re.escape(END) + r'$\n?', re.M | re.S)
@@ -79,6 +124,15 @@ class flowstate_telemetry (
       ]
 
 
+      def warn(msg):
+          sys.stderr.write('flowstate-telemetry: %s\n' % msg)
+
+
+      def shq(s):
+          # A single-quoted shell word: nothing in it is expanded.
+          return "'" + s.replace("'", "'\\''") + "'"
+
+
       def read(path):
           try:
               with open(path) as f:
@@ -87,68 +141,196 @@ class flowstate_telemetry (
               return None
 
 
-      def write(path, text, new_mode, force_mode):
-          # Temp file and rename: a new file gets new_mode; an existing file
-          # keeps its mode unless force_mode.
+      def resolve(path):
+          # The file to write for path. A symlink (a dotfiles repository) is
+          # followed, so it stays a link, but only to a regular file this user
+          # owns in a directory this user owns; otherwise None (warned).
+          real = os.path.realpath(path)
           try:
-              mode = new_mode if force_mode else os.stat(path).st_mode & 0o777
+              st = os.stat(real)
+              if st.st_uid != uid or not os.path.isfile(real):
+                  warn('%s resolves to %s, which is not a file this user owns: not changed' % (path, real))
+                  return None
           except FileNotFoundError:
-              mode = new_mode
-          fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.' + os.path.basename(path) + '.')
-          with os.fdopen(fd, 'w') as f:
-              f.write(text)
-          os.chmod(tmp, mode)
-          os.replace(tmp, path)
+              pass
+          try:
+              if os.stat(os.path.dirname(real)).st_uid != uid:
+                  warn('%s is in a directory this user does not own: not changed' % real)
+                  return None
+          except FileNotFoundError:
+              pass
+          return real
+
+
+      def load_json(path):
+          # The JSON object in path ({} when missing), or None (warned) when it
+          # cannot be merged, e.g. JSON with comments.
+          raw = read(path)
+          if not raw or not raw.strip():
+              return {}
+          try:
+              obj = json.loads(raw)
+          except ValueError:
+              warn('%s is not plain JSON (comments?): not changed' % path)
+              return None
+          if not isinstance(obj, dict):
+              warn('%s is not a JSON object: not changed' % path)
+              return None
+          return obj
 
 
       updates = []
 
+
+      def plan(path, text, new_mode, secret=False, force_mode=None, same=None):
+          # Queues a write of text when the content (for JSON: same) or the
+          # mode needs changing. A new file gets new_mode; an existing one
+          # keeps its mode, minus group/other bits when it holds the key
+          # (secret); force_mode overrides both.
+          real = resolve(path)
+          if real is None:
+              return
+          try:
+              cur = os.stat(real).st_mode & 0o777
+          except FileNotFoundError:
+              cur = None
+          if force_mode is not None:
+              mode = force_mode
+          elif cur is None:
+              mode = new_mode
+          elif secret:
+              mode = cur & ~0o077
+          else:
+              mode = cur
+          changed = read(real) != text if same is None else not same
+          if changed or cur != mode:
+              updates.append((real, text, mode))
+
+
+      def merge_json(path, update, new_mode, secret=False):
+          settings = load_json(path)
+          if settings is None:
+              return
+          before = json.dumps(settings, sort_keys=True)
+          if update(settings) is False:
+              return
+          same = os.path.exists(path) and json.dumps(settings, sort_keys=True) == before
+          plan(path, json.dumps(settings, indent=2) + '\n', new_mode, secret=secret, same=same)
+
+
+      def write(real, text, mode):
+          # A temp file next to the real file, renamed over it.
+          os.makedirs(os.path.dirname(real), 0o755, exist_ok=True)
+          fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.' + os.path.basename(real) + '.')
+          with os.fdopen(fd, 'w') as f:
+              f.write(text)
+          os.chmod(tmp, mode)
+          os.replace(tmp, real)
+
+
       conf = os.path.join(home, '.config', 'flowstate-telemetry')
-      env_path = os.path.join(conf, 'env')
-      env_text = 'FLOWSTATE_OTLP_ENDPOINT=%s\nFLOWSTATE_OTLP_KEY=%s\n' % (endpoint, key)
-      env_mode = os.stat(env_path).st_mode & 0o777 if os.path.exists(env_path) else None
-      if read(env_path) != env_text or env_mode != 0o600:
-          updates.append((env_path, env_text, 0o600, True))
+      plan(os.path.join(conf, 'env'), 'FLOWSTATE_OTLP_ENDPOINT=%s\nFLOWSTATE_OTLP_KEY=%s\n' % (endpoint, key), 0o600, force_mode=0o600)
 
-      claude_path = os.path.join(home, '.claude', 'settings.json')
-      raw = read(claude_path)
-      settings = json.loads(raw) if raw else {}
-      env = settings.setdefault('env', {})
-      env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
-      env.update({
-          'CLAUDE_CODE_ENABLE_TELEMETRY': '1',
-          'OTEL_METRICS_EXPORTER': 'otlp',
-          'OTEL_LOGS_EXPORTER': 'otlp',
-          'OTEL_EXPORTER_OTLP_PROTOCOL': 'http/protobuf',
-          'OTEL_EXPORTER_OTLP_ENDPOINT': endpoint,
-          'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=' + key,
-          'OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE': 'delta',
-          'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
-          'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true',
-      })
-      if not raw or json.loads(raw) != settings:
-          updates.append((claude_path, json.dumps(settings, indent=2) + '\n', 0o600, False))
 
-      block = '\n'.join([BEGIN, 'export FLOWSTATE_OTLP_ENDPOINT="%s"' % endpoint] + PROFILE_LINES + [END]) + '\n'
+      def claude(settings):
+          env = settings.setdefault('env', {})
+          if not isinstance(env, dict):
+              warn('~/.claude/settings.json "env" is not an object: not changed')
+              return False
+          env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
+          env.update({
+              'CLAUDE_CODE_ENABLE_TELEMETRY': '1',
+              'OTEL_METRICS_EXPORTER': 'otlp',
+              'OTEL_LOGS_EXPORTER': 'otlp',
+              'OTEL_EXPORTER_OTLP_PROTOCOL': 'http/protobuf',
+              'OTEL_EXPORTER_OTLP_ENDPOINT': endpoint,
+              'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=' + key,
+              'OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE': 'delta',
+              'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
+              'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true',
+          })
+
+
+      merge_json(os.path.join(home, '.claude', 'settings.json'), claude, 0o600, secret=True)
+
+
+      def copilot_chat(settings):
+          settings.update({
+              'github.copilot.chat.otel.enabled': True,
+              'github.copilot.chat.otel.exporterType': 'otlp-http',
+              'github.copilot.chat.otel.otlpEndpoint': endpoint,
+              'github.copilot.chat.otel.headers': {'x-flowstate-key': key},
+          })
+          # Settings Sync must not upload the headers setting (the key).
+          ignored = settings.get('settingsSync.ignoredSettings')
+          if not isinstance(ignored, list):
+              ignored = []
+          if 'github.copilot.chat.otel.headers' not in ignored:
+              ignored.append('github.copilot.chat.otel.headers')
+          settings['settingsSync.ignoredSettings'] = ignored
+
+
+      # VS Code Copilot Chat (holds the key), only where VS Code has a user
+      # settings directory.
+      if sys.platform == 'darwin':
+          vscode = os.path.join(home, 'Library', 'Application Support', 'Code', 'User')
+      else:
+          vscode = os.path.join(home, '.config', 'Code', 'User')
+      if os.path.isdir(vscode):
+          merge_json(os.path.join(vscode, 'settings.json'), copilot_chat, 0o600, secret=True)
+
+
+      def gemini(settings):
+          telemetry = settings.setdefault('telemetry', {})
+          if not isinstance(telemetry, dict):
+              warn('~/.gemini/settings.json "telemetry" is not an object: not changed')
+              return False
+          telemetry.update({
+              'enabled': True,
+              'target': 'local',
+              'otlpEndpoint': endpoint,
+              'otlpProtocol': 'http',
+              'logPrompts': False,
+          })
+
+
+      # Gemini CLI (no key: the gemini wrapper adds it), where it is in use.
+      if os.path.isdir(os.path.join(home, '.gemini')) or shutil.which('gemini'):
+          merge_json(os.path.join(home, '.gemini', 'settings.json'), gemini, 0o644)
+
+      # The profile block replaces the previous one where it stands, so lines
+      # the user added after it stay where they are and --check stays true.
+      block = '\n'.join([BEGIN, 'export FLOWSTATE_OTLP_ENDPOINT=' + shq(endpoint)] + PROFILE_LINES + [END]) + '\n'
       for name in rc_files:
           path = os.path.join(home, name)
           old = read(path) or ''
-          text = LEGACY.sub('', BLOCK.sub('', old))
-          if text and not text.endswith('\n'):
-              text += '\n'
-          text += block
+          first = BLOCK.search(old)
+          if first:
+              text = LEGACY.sub('', old[:first.start()]) + block + LEGACY.sub('', BLOCK.sub('', old[first.end():]))
+          else:
+              text = LEGACY.sub('', old)
+              if text and not text.endswith('\n'):
+                  text += '\n'
+              text += block
           if text != old:
-              updates.append((path, text, 0o644, False))
+              plan(path, text, 0o644)
 
       if check:
           sys.exit(1 if updates else 0)
       os.makedirs(conf, 0o700, exist_ok=True)
       os.chmod(conf, 0o700)
-      os.makedirs(os.path.dirname(claude_path), 0o755, exist_ok=True)
-      for path, text, mode, force in updates:
-          write(path, text, mode, force)
+      for real, text, mode in updates:
+          write(real, text, mode)
       | PYEOF
     require => File['/opt/flowstate-telemetry'],
+  }
+
+  # Reported on each run while no usable python3 is installed.
+  exec { 'flowstate-telemetry-python3':
+    command   => '/bin/echo "flowstate-telemetry: no usable python3 (macOS: install the Command Line Tools); user settings not configured"',
+    unless    => '/opt/flowstate-telemetry/configure-user --has-python',
+    logoutput => true,
+    require   => File['/opt/flowstate-telemetry/configure-user'],
   }
 
   $rc_files = $facts['os']['family'] ? {
@@ -165,67 +347,17 @@ class flowstate_telemetry (
 
     if $homedir and $homedir =~ /^\/(home|Users)\// {
 
-      # Env file, Claude Code settings (merged) and the shell profile block,
+      # Env file, the shell profile block and the tools' settings (merged),
       # written by the user. The key is passed in the environment.
       exec { "flowstate-telemetry-${username}":
-        command     => '/usr/bin/env python3 /opt/flowstate-telemetry/configure-user.py',
-        unless      => '/usr/bin/env python3 /opt/flowstate-telemetry/configure-user.py --check',
+        command     => '/opt/flowstate-telemetry/configure-user',
+        onlyif      => '/opt/flowstate-telemetry/configure-user --has-python',
+        unless      => '/opt/flowstate-telemetry/configure-user --check',
         user        => $username,
         cwd         => $homedir,
         environment => ["HOME=${homedir}", "FS_ENDPOINT=${endpoint}", "FS_KEY=${key}", "FS_RC_FILES=${rc_files}"],
         path        => ['/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/bin'],
-        require     => File['/opt/flowstate-telemetry/configure-user.py'],
-      }
-
-      # VS Code Copilot Chat settings (holds the key: 0600)
-      $vscode_dir = "${homedir}/.config/Code/User"
-
-      exec { "check-vscode-${username}":
-        command => "/bin/true",
-        onlyif  => "/usr/bin/test -d ${vscode_dir}",
-      }
-
-      file { "${vscode_dir}/settings.json":
-        ensure  => file,
-        owner   => $username,
-        mode    => '0600',
-        replace => false,
-        content => @("VSCODEEOF")
-          {
-            "github.copilot.chat.otel.enabled": true,
-            "github.copilot.chat.otel.exporterType": "otlp-http",
-            "github.copilot.chat.otel.otlpEndpoint": "${endpoint}",
-            "github.copilot.chat.otel.headers": { "x-flowstate-key": "${key}" },
-            "settingsSync.ignoredSettings": ["github.copilot.chat.otel.headers"]
-          }
-          | VSCODEEOF
-        require => Exec["check-vscode-${username}"],
-      }
-
-      # Gemini CLI settings (no key: the gemini wrapper adds it)
-      file { "${homedir}/.gemini":
-        ensure => directory,
-        owner  => $username,
-        mode   => '0755',
-      }
-
-      file { "${homedir}/.gemini/settings.json":
-        ensure  => file,
-        owner   => $username,
-        mode    => '0644',
-        replace => false,
-        content => @("GEMINIEOF")
-          {
-            "telemetry": {
-              "enabled": true,
-              "target": "local",
-              "otlpEndpoint": "${endpoint}",
-              "otlpProtocol": "http",
-              "logPrompts": false
-            }
-          }
-          | GEMINIEOF
-        require => File["${homedir}/.gemini"],
+        require     => File['/opt/flowstate-telemetry/configure-user', '/opt/flowstate-telemetry/configure-user.py'],
       }
     }
   }

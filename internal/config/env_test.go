@@ -80,3 +80,62 @@ func TestLegacyEndpointMatching(t *testing.T) {
 		}
 	}
 }
+
+func TestValidate(t *testing.T) {
+	ok := []struct {
+		endpoint string
+		loopback bool
+	}{
+		{"https://otel.flowstate.host", false},
+		{"https://otel.flowstate.host:8443/base/", false},
+		{"https://[::1]:8787", false},
+		{"http://localhost:8787", true},
+		{"http://127.0.0.1:8787", true},
+	}
+	for _, c := range ok {
+		if err := (Config{Endpoint: c.endpoint, Key: "fs_key"}).Validate(c.loopback); err != nil {
+			t.Errorf("%q rejected: %v", c.endpoint, err)
+		}
+	}
+	for _, c := range []struct {
+		endpoint string
+		loopback bool
+	}{
+		{"http://otel.flowstate.host", true},
+		{"http://localhost:8787", false},
+		{"ftp://otel.flowstate.host", false},
+		{"otel.flowstate.host", false},
+		{"https://", false},
+		{`https://x.example/"$(id)"`, false},
+		{"https://x.example/`id`", false},
+		{"https://x.example/'q'", false},
+		{"https://x.example/a b", false},
+		{"https://x.example/\nx", false},
+		{"https://x.example/\\", false},
+		{"https://x.example/?q=1", false},
+		{"https://x.example/#f", false},
+		{"https://user@x.example", false},
+	} {
+		if err := (Config{Endpoint: c.endpoint}).Validate(c.loopback); err == nil {
+			t.Errorf("%q accepted", c.endpoint)
+		}
+	}
+	for _, bad := range []Config{
+		{Endpoint: DefaultEndpoint, Key: "k\ney"},
+		{Endpoint: DefaultEndpoint, Key: "k\rey"},
+		{Endpoint: DefaultEndpoint, Key: "k\x00"},
+		{Endpoint: DefaultEndpoint, Key: "k\x7f"},
+		{Endpoint: DefaultEndpoint, Key: "k\tey"},
+		{Endpoint: DefaultEndpoint, Email: "a@b\n"},
+		{Endpoint: DefaultEndpoint, TeamID: "t\n"},
+	} {
+		if err := bad.Validate(false); err == nil {
+			t.Errorf("%+v accepted", bad)
+		}
+	}
+	// Quotes, $, backticks and $(...) in a key are fine: every artefact
+	// quotes the key for its own language.
+	if err := (Config{Endpoint: DefaultEndpoint, Key: "k'e\"y$x`id`$(id)\\"}).Validate(false); err != nil {
+		t.Errorf("hostile-but-printable key rejected: %v", err)
+	}
+}

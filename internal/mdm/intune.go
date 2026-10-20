@@ -3,6 +3,7 @@ package mdm
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/template"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -32,8 +33,9 @@ const intuneTemplate = `# Flowstate Telemetry — Microsoft Intune deployment sc
 
 $ErrorActionPreference = "Stop"
 
-$Endpoint = "{{ .Endpoint }}"
-$Key = "{{ .Key }}"
+# Single-quoted literals: nothing in them is expanded or executed.
+$Endpoint = {{ ps .Endpoint }}
+$Key = {{ ps .Key }}
 
 Write-Host "Configuring Flowstate Telemetry..."
 
@@ -186,7 +188,7 @@ func GenerateIntuneMachineCleanup(w io.Writer) error {
 // It runs as the logged-on user; see GenerateIntuneMachineCleanup for the
 // machine-wide clean-up that needs admin rights.
 func GenerateIntune(w io.Writer, cfg config.Config) error {
-	tmpl, err := template.New("intune").Parse(intuneTemplate)
+	tmpl, err := template.New("intune").Funcs(template.FuncMap{"ps": psQuote}).Parse(intuneTemplate)
 	if err != nil {
 		return fmt.Errorf("parsing template: %w", err)
 	}
@@ -195,4 +197,11 @@ func GenerateIntune(w io.Writer, cfg config.Config) error {
 		"Endpoint": cfg.Endpoint,
 		"Key":      cfg.Key,
 	})
+}
+
+// psQuote renders s as a single-quoted PowerShell string: no variable or
+// $(...) expansion, and a quote (including the typographic ones PowerShell
+// also treats as quotes) is doubled.
+func psQuote(s string) string {
+	return "'" + strings.NewReplacer("'", "''", "\u2018", "\u2018\u2018", "\u2019", "\u2019\u2019", "\u201a", "\u201a\u201a", "\u201b", "\u201b\u201b").Replace(s) + "'"
 }

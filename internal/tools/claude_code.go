@@ -51,8 +51,9 @@ func (c *ClaudeCode) writeSettings(settings map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
-	// The file holds the key: a new file is private (0600); an existing
-	// file keeps its mode.
+	// The file holds the key: a new file is private (0600). Install
+	// tightens an existing one (tightenMode). Written in place, so a
+	// symlinked settings.json stays a symlink.
 	return os.WriteFile(c.settingsPath(), data, 0600)
 }
 
@@ -105,7 +106,11 @@ func (c *ClaudeCode) Install(cfg config.Config) error {
 		return nil
 	}
 
-	return c.writeSettings(settings)
+	if err := c.writeSettings(settings); err != nil {
+		return err
+	}
+	// It now holds the key.
+	return tightenMode(c.settingsPath())
 }
 
 func (c *ClaudeCode) Remove() error {

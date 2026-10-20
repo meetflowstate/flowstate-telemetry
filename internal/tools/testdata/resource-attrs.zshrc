@@ -19,7 +19,7 @@ function qwen { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXP
 # --- End Flowstate Telemetry: qwen-code ---
 
 # --- Flowstate Telemetry ---
-export FLOWSTATE_OTLP_ENDPOINT="https://otel.flowstate.host"
+export FLOWSTATE_OTLP_ENDPOINT='https://otel.flowstate.host'
 # FLOWSTATE_OTLP_KEY is read from the env file (mode 0600), not stored here.
 _fs_env='$HOME/.config/flowstate-telemetry/env'; if [ -r "$_fs_env" ]; then while IFS= read -r _fs_l || [ -n "$_fs_l" ]; do case "$_fs_l" in FLOWSTATE_OTLP_KEY=*) export FLOWSTATE_OTLP_KEY="${_fs_l#FLOWSTATE_OTLP_KEY=}"; break ;; esac; done < "$_fs_env"; fi; unset _fs_env _fs_l
 # --- End Flowstate Telemetry ---

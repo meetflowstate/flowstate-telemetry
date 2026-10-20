@@ -11,7 +11,6 @@ import (
 
 var (
 	flagMDMFormat         string
-	flagMDMTool           string
 	flagMDMMachineCleanup bool
 )
 
@@ -31,7 +30,6 @@ them.`,
 
 func init() {
 	generateMDMCmd.Flags().StringVar(&flagMDMFormat, "format", "", "Output format: jamf, intune, ansible, puppet (required)")
-	generateMDMCmd.Flags().StringVar(&flagMDMTool, "tool", "", "Generate config for specific tool only")
 	generateMDMCmd.Flags().BoolVar(&flagMDMMachineCleanup, "machine-cleanup", false, "Intune: generate the run-once SYSTEM script that removes machine-wide variables earlier versions set (no key)")
 	_ = generateMDMCmd.MarkFlagRequired("format")
 	rootCmd.AddCommand(generateMDMCmd)
@@ -47,6 +45,9 @@ func runGenerateMDM(cmd *cobra.Command, args []string) error {
 
 	cfg := config.FromEnv(flagEndpoint, flagKey)
 	cfg.Verbose = flagVerbose
+	if err := cfg.Validate(false); err != nil {
+		return err
+	}
 
 	if cfg.Key == "" {
 		fmt.Fprintln(os.Stderr, "Warning: no API key set. The generated artefact will have an empty key placeholder.")

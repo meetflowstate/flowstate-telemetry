@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -120,4 +121,61 @@ func (c Config) SignalEndpoint(signal string) string {
 // HeadersEnv returns the OTEL_EXPORTER_OTLP_HEADERS value carrying the key.
 func (c Config) HeadersEnv() string {
 	return AuthHeader + "=" + c.Key
+}
+
+// endpointChars are the only characters an endpoint may contain: a URL's
+// unreserved characters plus ':', '/', '%' and IPv6 brackets. Quotes,
+// whitespace, '$', backticks and backslashes never reach a shell profile,
+// script or settings file.
+var endpointChars = regexp.MustCompile(`^[A-Za-z0-9._~:/%\[\]-]+$`)
+
+// ValidateEndpoint rejects an endpoint that is not a plain https URL (scheme,
+// host, optional port and path; no credentials, query or fragment). With
+// allowLoopbackHTTP, http is accepted for localhost, 127.0.0.1 and [::1]
+// (a local receiver during development).
+func ValidateEndpoint(endpoint string, allowLoopbackHTTP bool) error {
+	if !endpointChars.MatchString(endpoint) {
+		return fmt.Errorf("endpoint %q: only letters, digits and . _ ~ : / %% - [ ] are allowed (no quotes, spaces or shell characters)", endpoint)
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return fmt.Errorf("endpoint %q is not a base URL like https://otel.flowstate.host", endpoint)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && allowLoopbackHTTP && isLoopback(u.Hostname()):
+	default:
+		return fmt.Errorf("endpoint %q must use https", endpoint)
+	}
+	return nil
+}
+
+func isLoopback(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// ValidateValue rejects a key, team id or e-mail holding control characters
+// (newlines would split the env file, profile and generated scripts).
+func ValidateValue(name, value string) error {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s contains a control character (newline, tab or similar)", name)
+		}
+	}
+	return nil
+}
+
+// Validate checks the endpoint, key, team id and e-mail before they are
+// written anywhere. allowLoopbackHTTP is for a local receiver (install only;
+// MDM artefacts always require https).
+func (c Config) Validate(allowLoopbackHTTP bool) error {
+	if err := ValidateEndpoint(c.BaseEndpoint(), allowLoopbackHTTP); err != nil {
+		return err
+	}
+	for _, v := range [][2]string{{"key", c.Key}, {"FLOWSTATE_TEAM_ID", c.TeamID}, {"FLOWSTATE_EMAIL", c.Email}} {
+		if err := ValidateValue(v[0], v[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,38 @@ func writeJSONFile(path string, v map[string]interface{}, mode os.FileMode) erro
 		return fmt.Errorf("marshaling %s: %w", filepath.Base(path), err)
 	}
 	return os.WriteFile(path, append(data, '\n'), mode)
+}
+
+// tightenMode removes group and other permissions from path when it has
+// any, for files that hold the key: 0644 becomes 0600. It never loosens a
+// mode (0400 stays 0400). A symlink's target is changed.
+func tightenMode(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(path, perm&^0o077); err != nil {
+			return fmt.Errorf("restricting %s to its owner: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// writeKeyFile writes a file that holds the key: a new file is 0600 and an
+// existing one is tightened (tightenMode). Like os.WriteFile it writes
+// through a symlink (a dotfiles-managed file stays a symlink).
+func writeKeyFile(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return tightenMode(path)
+}
+
+// fileExists reports whether path exists (following symlinks).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // redactKey hides the Flowstate key in dry-run output.
@@ -149,7 +182,8 @@ func resourceAttrsAssignment(cfg config.Config) []string {
 
 // mergeResourceAttrs returns the OTEL_RESOURCE_ATTRIBUTES value existing
 // with this CLI's flowstate.* entries replaced by ours ("" removes them),
-// keeping the user's own entries in their order.
+// keeping the user's own entries in their order. Values are percent-encoded
+// (shell.EncodeResourceValue), so ',' only ever separates entries.
 func mergeResourceAttrs(existing, ours string) string {
 	var kept []string
 	for _, kv := range strings.Split(existing, ",") {
@@ -166,10 +200,13 @@ func mergeResourceAttrs(existing, ours string) string {
 }
 
 // isFlowstateAttr reports whether one key=value resource attribute is one
-// this CLI writes.
+// this CLI writes. The key is compared percent-decoded.
 func isFlowstateAttr(kv string) bool {
 	k, _, _ := strings.Cut(kv, "=")
 	k = strings.TrimSpace(k)
+	if d, err := url.PathUnescape(k); err == nil {
+		k = d
+	}
 	return k == "flowstate.team_id" || k == "flowstate.email"
 }
 

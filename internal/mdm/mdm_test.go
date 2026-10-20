@@ -46,7 +46,7 @@ func TestTemplates_FollowHTTPContract(t *testing.T) {
 			if strings.Contains(out, "github.copilot.chat.otel.exporterType") && !strings.Contains(out, "otlp-http") {
 				t.Errorf("%s configures Copilot Chat without otlp-http", name)
 			}
-			if strings.Contains(out, "otlpProtocol") && !strings.Contains(out, `"otlpProtocol": "http"`) {
+			if strings.Contains(out, "otlpProtocol") && !strings.Contains(out, `"otlpProtocol": "http"`) && !strings.Contains(out, `'otlpProtocol': 'http'`) {
 				t.Errorf("%s configures Gemini without otlpProtocol http", name)
 			}
 			if strings.Contains(out, "github.copilot.chat.otel.headers") && !strings.Contains(out, "settingsSync.ignoredSettings") {
@@ -66,15 +66,17 @@ func TestTemplates_NoGlobalOTelHeaders(t *testing.T) {
 		"jamf": GenerateJamf, "intune": GenerateIntune, "ansible": GenerateAnsible, "puppet": GeneratePuppet,
 	}
 	allowed := []string{
-		`"OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=`,            // Claude Code settings.json env block
-		`'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=`,            // the same, merged by Python (Jamf)
-		`"OTEL_EXPORTER_OTLP_HEADERS" = "x-flowstate-key=`,           // the same, PowerShell hashtable (Intune)
-		`command gemini "$@"`,                                        // wrapper function scoped to one command
+		`"OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=`,                             // Claude Code settings.json env block
+		`'OTEL_EXPORTER_OTLP_HEADERS': 'x-flowstate-key=`,                             // the same, merged by Python (Jamf, Puppet)
+		`"OTEL_EXPORTER_OTLP_HEADERS": {{ ('x-flowstate-key=' ~ fs_key) | to_json }}`, // the same, Ansible
+		`"OTEL_EXPORTER_OTLP_HEADERS" = "x-flowstate-key=`,                            // the same, PowerShell hashtable (Intune)
+		`command gemini "$@"`, // wrapper function scoped to one command
 		`SetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS", $null`, // Intune clean-up
 		`GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS"`,
 		`Remove-MachineVariable "OTEL_EXPORTER_OTLP_HEADERS"`,
-		`for VAR in OTEL_EXPORTER_OTLP_HEADERS`, // Jamf clean-up (unsetenv)
-		`- OTEL_EXPORTER_OTLP_HEADERS`,          // Ansible clean-up loop (state: absent)
+		`launchctl getenv OTEL_EXPORTER_OTLP_HEADERS`,   // Jamf clean-up: read,
+		`launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS`, // then unset only when it carries the key
+		`- OTEL_EXPORTER_OTLP_HEADERS`,                  // Ansible clean-up loop (state: absent)
 	}
 	for name, gen := range generators {
 		t.Run(name, func(t *testing.T) {
@@ -166,7 +168,8 @@ func TestJamf_PerUserWritesAsUser(t *testing.T) {
 		`umask 077`, `chmod 700 "$dir"`, `tmp=$(mktemp "$dir/.env.XXXXXX")`, `mv -f "$tmp" "$dir/env"`,
 		`[ ! -L "$HOMEDIR" ]`, `rm -f /etc/flowstate-telemetry.env`,
 		`DEFAULT_KEY='fs_key'`, `KEY="${4:-$DEFAULT_KEY}"`,
-		`os.chmod(tmp, mode)`, `os.replace(tmp, path)`,
+		`os.chmod(tmp, mode)`, `os.replace(tmp, real)`, `real = os.path.realpath(path)`,
+		`*x-flowstate-key*)`, `*[[:cntrl:]]*)`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("jamf output missing %q", want)
@@ -274,7 +277,7 @@ func TestAnsible_ProfileAndKeyFiles(t *testing.T) {
 	if !strings.Contains(loop, ".zshrc") || !strings.Contains(loop, "Darwin") {
 		t.Errorf("profile block not written to ~/.zshrc on macOS: %s", loop)
 	}
-	for _, f := range []string{"/.config/flowstate-telemetry/env", "/.claude/settings.json", "/.config/Code/User/settings.json"} {
+	for _, f := range []string{"/.config/flowstate-telemetry/env", "/.claude/settings.json", "/settings.json"} {
 		if modes[f] != "0600" {
 			t.Errorf("%s mode = %q, want 0600", f, modes[f])
 		}
@@ -282,7 +285,10 @@ func TestAnsible_ProfileAndKeyFiles(t *testing.T) {
 	if strings.Contains(buf.String(), "lookup('pipe'") || !strings.Contains(buf.String(), "command -v gemini") {
 		t.Error("gemini check must run on the target")
 	}
-	checkShell(t, "ansible profile block", strings.ReplaceAll(block, "{{ flowstate_endpoint }}", "https://otel.flowstate.host"))
+	if !strings.Contains(buf.String(), "/Library/Application Support/Code/User' if ansible_system == 'Darwin'") {
+		t.Error("VS Code settings path is not chosen per OS")
+	}
+	checkShell(t, "ansible profile block", strings.ReplaceAll(block, "{{ fs_endpoint | quote }}", "https://otel.flowstate.host"))
 }
 
 // Puppet merges Claude Code's settings (no whole-file rewrite), writes the
@@ -299,15 +305,21 @@ func TestPuppet_MergesAndWritesAsUser(t *testing.T) {
 		`"FS_KEY=${key}"`,
 		`'Darwin' => '.bashrc .zshrc'`,
 		`env.update({`,
-		`json.loads(raw) if raw else {}`,
+		`merge_json(`,
 		`--check`,
+		`onlyif      => '/opt/flowstate-telemetry/configure-user --has-python'`,
+		`/usr/bin/xcode-select -p`,
 		`String $key      = 'fs_key'`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("puppet output missing %q", want)
 		}
 	}
-	for _, banned := range []string{`"${homedir}/.claude/settings.json"`, "file_line", `FLOWSTATE_OTLP_KEY=\"${key}\"`} {
+	for _, banned := range []string{
+		`"${homedir}/.claude/settings.json"`, "file_line", `FLOWSTATE_OTLP_KEY=\"${key}\"`,
+		// No root-run file resources under a home directory.
+		`file { "${vscode_dir}`, `file { "${homedir}`, "replace => false", "/usr/bin/env python3",
+	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("puppet output contains %q", banned)
 		}

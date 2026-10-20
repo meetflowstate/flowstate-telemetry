@@ -12,11 +12,13 @@ import (
 var verifyCmd = &cobra.Command{
 	Use:   "verify",
 	Short: "Verify telemetry configuration for all detected tools",
-	Long: `Verify checks the configuration of each detected AI tool and
-reports whether telemetry is correctly configured. For tools with OTel
-endpoints, it optionally sends a test event.
+	Long: `Verify checks this machine's configuration without sending anything:
+the environment (left-over global OTEL_* variables, the retired endpoint, the
+shell profile, the --gui-env LaunchAgent, machine-wide files) and, for each
+detected AI tool, its local settings files and wrapper functions.
 
-Exit code 0 if all detected tools pass. Exit code 1 if any have warnings or errors.`,
+Exit code 0 if every check passes. Exit code 1 if any check fails or has a
+warning.`,
 	RunE: runVerify,
 }
 

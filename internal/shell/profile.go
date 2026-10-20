@@ -205,7 +205,9 @@ func KeyLoader(envFile string) string {
 func buildEnvBlock(cfg config.Config) string {
 	var lines []string
 	lines = append(lines, markerStart)
-	lines = append(lines, fmt.Sprintf("export FLOWSTATE_OTLP_ENDPOINT=%q", cfg.BaseEndpoint()))
+	// Single-quoted: a double-quoted value would run $(...) or backticks
+	// at every shell start.
+	lines = append(lines, "export FLOWSTATE_OTLP_ENDPOINT="+shQuote(cfg.BaseEndpoint()))
 
 	lines = append(lines, "# FLOWSTATE_OTLP_KEY is read from the env file (mode 0600), not stored here.")
 	lines = append(lines, KeyLoader(hooks.EnvFilePath()))
@@ -218,16 +220,35 @@ func buildEnvBlock(cfg config.Config) string {
 // ResourceAttributes returns the OTEL_RESOURCE_ATTRIBUTES value (Flowstate
 // team and email only), or "" when neither is set. It deliberately carries
 // no service.name: each tool sets its own. Callers scope it to one tool
-// (settings or a wrapper function); it is never exported globally.
+// (settings or a wrapper function); it is never exported globally. Values
+// are percent-encoded (EncodeResourceValue).
 func ResourceAttributes(cfg config.Config) string {
 	var attrs []string
 	if cfg.TeamID != "" {
-		attrs = append(attrs, fmt.Sprintf("flowstate.team_id=%s", cfg.TeamID))
+		attrs = append(attrs, "flowstate.team_id="+EncodeResourceValue(cfg.TeamID))
 	}
 	if cfg.Email != "" {
-		attrs = append(attrs, fmt.Sprintf("flowstate.email=%s", cfg.Email))
+		attrs = append(attrs, "flowstate.email="+EncodeResourceValue(cfg.Email))
 	}
 	return strings.Join(attrs, ",")
+}
+
+// EncodeResourceValue percent-encodes one OTEL_RESOURCE_ATTRIBUTES value as
+// the OpenTelemetry SDK environment spec requires (W3C Baggage octets): every
+// byte outside the baggage-octet range (control characters, space, '"', ',',
+// ';', backslash and non-ASCII) is encoded, and so are '%' and '=' so the value
+// decodes back unchanged.
+func EncodeResourceValue(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c > 0x20 && c < 0x7f && !strings.ContainsRune("\",;\\%=", rune(c)) {
+			b.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&b, "%%%02X", c)
+	}
+	return b.String()
 }
 
 func removeExistingBlock(content, start, end string) string {

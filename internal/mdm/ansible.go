@@ -3,6 +3,7 @@ package mdm
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/template"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
@@ -24,15 +25,34 @@ const ansibleTemplate = `---
 # profile (~/.bashrc, and ~/.zshrc on macOS) reads it from there at start-up
 # and Gemini CLI gets it from a "gemini" wrapper function; no profile stores
 # the key. Settings files that hold the key are created 0600.
+#
+# Set flowstate_endpoint / flowstate_key (inventory, host_vars, --extra-vars)
+# to override the defaults below. The defaults are !unsafe: Ansible never
+# templates them, so a key containing "{{ "{{" }}" is used literally.
 
 - name: Configure Flowstate AI Telemetry
   hosts: developers
   become: false
   vars:
-    flowstate_endpoint: "{{ "{{ flowstate_endpoint | default('" }}{{ .Endpoint }}{{ "') }}" }}"
-    flowstate_key: "{{ "{{ flowstate_key | default('" }}{{ .Key }}{{ "') }}" }}"
+    flowstate_default_endpoint: !unsafe {{ yq .Endpoint }}
+    flowstate_default_key: !unsafe {{ yq .Key }}
+    fs_endpoint: "{{ "{{ flowstate_endpoint | default(flowstate_default_endpoint) }}" }}"
+    fs_key: "{{ "{{ flowstate_key | default(flowstate_default_key) }}" }}"
+    # VS Code's user settings directory differs on macOS.
+    fs_vscode_dir: "{{ "{{ ansible_env.HOME ~ ('/Library/Application Support/Code/User' if ansible_system == 'Darwin' else '/.config/Code/User') }}" }}"
 
   tasks:
+    # A newline would split the env file and settings; quotes or shell
+    # characters in the endpoint would reach the shell profile.
+    - name: Check the Flowstate endpoint and key
+      assert:
+        that:
+          - fs_endpoint is match('^https://[A-Za-z0-9._~:/%\[\]-]+$')
+          - fs_key is not search('[\x00-\x1f\x7f]')
+        fail_msg: "flowstate_endpoint must be an https URL (no quotes, spaces or shell characters) and flowstate_key may not contain control characters"
+        quiet: true
+      no_log: true
+
     - name: Remove the world-readable, process-wide variables written by earlier versions
       become: true
       lineinfile:
@@ -61,8 +81,8 @@ const ansibleTemplate = `---
       copy:
         dest: "{{ "{{ ansible_env.HOME }}" }}/.config/flowstate-telemetry/env"
         content: |
-          FLOWSTATE_OTLP_ENDPOINT={{ "{{ flowstate_endpoint }}" }}
-          FLOWSTATE_OTLP_KEY={{ "{{ flowstate_key }}" }}
+          FLOWSTATE_OTLP_ENDPOINT={{ "{{ fs_endpoint }}" }}
+          FLOWSTATE_OTLP_KEY={{ "{{ fs_key }}" }}
         mode: "0600"
       no_log: true
 
@@ -82,8 +102,8 @@ const ansibleTemplate = `---
               "OTEL_METRICS_EXPORTER": "otlp",
               "OTEL_LOGS_EXPORTER": "otlp",
               "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-              "OTEL_EXPORTER_OTLP_ENDPOINT": "{{ "{{ flowstate_endpoint }}" }}",
-              "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key={{ "{{ flowstate_key }}" }}",
+              "OTEL_EXPORTER_OTLP_ENDPOINT": {{ "{{ fs_endpoint | to_json }}" }},
+              "OTEL_EXPORTER_OTLP_HEADERS": {{ "{{ ('x-flowstate-key=' ~ fs_key) | to_json }}" }},
               "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
               "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
               "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"
@@ -96,18 +116,18 @@ const ansibleTemplate = `---
 
     - name: Check if VS Code settings directory exists
       stat:
-        path: "{{ "{{ ansible_env.HOME }}" }}/.config/Code/User"
+        path: "{{ "{{ fs_vscode_dir }}" }}"
       register: vscode_dir
 
     - name: Configure VS Code Copilot Chat telemetry
       copy:
-        dest: "{{ "{{ ansible_env.HOME }}" }}/.config/Code/User/settings.json"
+        dest: "{{ "{{ fs_vscode_dir }}" }}/settings.json"
         content: |
           {
             "github.copilot.chat.otel.enabled": true,
             "github.copilot.chat.otel.exporterType": "otlp-http",
-            "github.copilot.chat.otel.otlpEndpoint": "{{ "{{ flowstate_endpoint }}" }}",
-            "github.copilot.chat.otel.headers": { "x-flowstate-key": "{{ "{{ flowstate_key }}" }}" },
+            "github.copilot.chat.otel.otlpEndpoint": {{ "{{ fs_endpoint | to_json }}" }},
+            "github.copilot.chat.otel.headers": { "x-flowstate-key": {{ "{{ fs_key | to_json }}" }} },
             "settingsSync.ignoredSettings": ["github.copilot.chat.otel.headers"]
           }
         mode: "0600"
@@ -137,7 +157,7 @@ const ansibleTemplate = `---
             "telemetry": {
               "enabled": true,
               "target": "local",
-              "otlpEndpoint": "{{ "{{ flowstate_endpoint }}" }}",
+              "otlpEndpoint": {{ "{{ fs_endpoint | to_json }}" }},
               "otlpProtocol": "http",
               "logPrompts": false
             }
@@ -153,7 +173,7 @@ const ansibleTemplate = `---
         path: "{{ "{{ ansible_env.HOME }}/{{ item }}" }}"
         marker: "# {mark} Flowstate Telemetry"
         block: |
-          export FLOWSTATE_OTLP_ENDPOINT="{{ "{{ flowstate_endpoint }}" }}"
+          export FLOWSTATE_OTLP_ENDPOINT={{ "{{ fs_endpoint | quote }}" }}
 {{ range .ProfileLines }}          {{ . }}
 {{ end }}        create: true
       loop: "{{ "{{ ['.bashrc', '.zshrc'] if ansible_system == 'Darwin' else ['.bashrc'] }}" }}"
@@ -161,7 +181,7 @@ const ansibleTemplate = `---
 
 // GenerateAnsible writes an Ansible playbook for Flowstate telemetry deployment.
 func GenerateAnsible(w io.Writer, cfg config.Config) error {
-	tmpl, err := template.New("ansible").Parse(ansibleTemplate)
+	tmpl, err := template.New("ansible").Funcs(template.FuncMap{"yq": yamlQuote}).Parse(ansibleTemplate)
 	if err != nil {
 		return fmt.Errorf("parsing template: %w", err)
 	}
@@ -184,4 +204,11 @@ func profileLines() []string {
 		"# Scopes the key and delta temporality to Gemini CLI only.",
 		`function gemini { OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta OTEL_EXPORTER_OTLP_HEADERS="x-flowstate-key=${FLOWSTATE_OTLP_KEY:-}" command gemini "$@"; }`,
 	}
+}
+
+// yamlQuote renders s as a single-quoted YAML scalar (a quote is doubled;
+// nothing else is special). Values with control characters are rejected
+// before generation (config.Validate).
+func yamlQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

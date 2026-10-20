@@ -31,6 +31,14 @@ ENDPOINT={{ sh .Endpoint }}
 # shellcheck disable=SC2016 # the key is literal
 DEFAULT_KEY={{ sh .Key }}
 KEY="${4:-$DEFAULT_KEY}"
+# A newline or other control character would split the key across the lines
+# it is passed and written on.
+case "$KEY" in
+*[[:cntrl:]]*)
+    echo "==> The Flowstate key (parameter 4) contains a control character; nothing was changed." >&2
+    exit 1
+    ;;
+esac
 
 echo "==> Configuring Flowstate telemetry for all users..."
 
@@ -47,9 +55,17 @@ CONSOLE_USER=$(stat -f %Su /dev/console 2>/dev/null || true)
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
     CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
     if [ -n "$CONSOLE_UID" ]; then
-        for VAR in OTEL_EXPORTER_OTLP_HEADERS FLOWSTATE_OTLP_KEY FLOWSTATE_OTLP_ENDPOINT; do
+        for VAR in FLOWSTATE_OTLP_KEY FLOWSTATE_OTLP_ENDPOINT; do
             launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" launchctl unsetenv "$VAR" 2>/dev/null || true
         done
+        # Only a value carrying the Flowstate key: one the user set for their
+        # own collector is left alone.
+        HEADERS=$(launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" launchctl getenv OTEL_EXPORTER_OTLP_HEADERS 2>/dev/null || true)
+        case "$HEADERS" in
+        *x-flowstate-key*)
+            launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" launchctl unsetenv OTEL_EXPORTER_OTLP_HEADERS 2>/dev/null || true
+            ;;
+        esac
     fi
 fi
 
@@ -69,18 +85,29 @@ fi
 
 # Merges Flowstate's env block into a Claude Code settings.json (argv[1]).
 # The endpoint and key come from FS_ENDPOINT / FS_KEY in the environment,
-# never the command line (visible in ps). It writes a temp file next to the
-# target and renames it over: a new file is 0600, an existing one keeps its
-# mode.
+# never the command line (visible in ps). A symlinked settings.json (a
+# dotfiles repository) is followed: the temp file is written next to the real
+# file, which is replaced, so the link stays a link. That happens only when
+# the real file and its directory belong to this user (it runs as the user,
+# so a link can only lead to a file the user could already write). A new file
+# is 0600; an existing one keeps its mode, minus any group/other bits (it now
+# holds the key).
 read -r -d '' MERGE_CLAUDE <<'PYEOF' || true
 import json, os, sys, tempfile
 path = sys.argv[1]
+real = os.path.realpath(path)
+uid = os.getuid()
 try:
-    with open(path) as f:
+    st = os.stat(real)
+    if st.st_uid != uid or not os.path.isfile(real):
+        sys.exit('  warning: %s resolves to %s, which is not a file this user owns: not changed' % (path, real))
+    with open(real) as f:
         s = json.load(f)
-    mode = os.stat(path).st_mode & 0o777
+    mode = st.st_mode & 0o777 & ~0o077
 except FileNotFoundError:
     s, mode = {}, 0o600
+if os.stat(os.path.dirname(real)).st_uid != uid:
+    sys.exit('  warning: %s is in a directory this user does not own: not changed' % real)
 env = s.setdefault('env', {})
 env.pop('OTEL_METRICS_TEMPORALITY_PREFERENCE', None)
 env.update({
@@ -94,12 +121,12 @@ env.update({
     'OTEL_METRICS_INCLUDE_SESSION_ID': 'true',
     'OTEL_METRICS_INCLUDE_ACCOUNT_UUID': 'true',
 })
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.settings.json.')
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.settings.json.')
 with os.fdopen(fd, 'w') as f:
     json.dump(s, f, indent=2)
     f.write('\n')
 os.chmod(tmp, mode)
-os.replace(tmp, path)
+os.replace(tmp, real)
 PYEOF
 
 # Configures one user's files. It runs AS that user (sudo -u), never as root:
@@ -110,7 +137,7 @@ PYEOF
 # shellcheck disable=SC2329 # run under sudo via declare -f
 configure_user() {
     set -euo pipefail
-    local home="$1" python="$2" merge="$3" endpoint key dir tmp settings
+    local home="$1" python="$2" merge="$3" endpoint key jkey dir tmp settings
     IFS= read -r endpoint
     IFS= read -r key
     umask 077
@@ -129,7 +156,11 @@ configure_user() {
     settings="$home/.claude/settings.json"
     if [ -n "$python" ]; then
         FS_ENDPOINT="$endpoint" FS_KEY="$key" "$python" -c "$merge" "$settings"
-    elif [ ! -e "$settings" ]; then
+    elif [ ! -e "$settings" ] && [ ! -L "$settings" ]; then
+        # JSON string escaping for the key (the endpoint is a plain URL and
+        # control characters were rejected above): \ and " only.
+        jkey=${key//\\/\\\\}
+        jkey=${jkey//\"/\\\"}
         tmp=$(mktemp "$home/.claude/.settings.json.XXXXXX")
         cat > "$tmp" <<CLAUDEEOF
 {
@@ -139,7 +170,7 @@ configure_user() {
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "$endpoint",
-    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=$key",
+    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=$jkey",
     "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
     "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true"

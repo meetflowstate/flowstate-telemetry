@@ -109,7 +109,7 @@ func (g *GeminiCLI) writeSettings(settings map[string]interface{}) error {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
 	// The file may hold the key (telemetry.otlpHeaders): a new file is
-	// private (0600); an existing file keeps its mode.
+	// private (0600); Install tightens an existing one that holds it.
 	return os.WriteFile(g.settingsPath(), data, 0600)
 }
 
@@ -145,19 +145,24 @@ func (g *GeminiCLI) Install(cfg config.Config) error {
 	if err := g.writeSettings(settings); err != nil {
 		return err
 	}
+	if inSettings {
+		if err := tightenMode(g.settingsPath()); err != nil {
+			return err
+		}
+	}
 	return shell.WriteToolBlock(g.Name(), block, false)
 }
 
 func (g *GeminiCLI) Remove() error {
-	settings, err := g.readSettings()
-	if err != nil {
-		return err
-	}
-
-	delete(settings, "telemetry")
-
-	if err := g.writeSettings(settings); err != nil {
-		return err
+	if fileExists(g.settingsPath()) {
+		settings, err := g.readSettings()
+		if err != nil {
+			return err
+		}
+		delete(settings, "telemetry")
+		if err := g.writeSettings(settings); err != nil {
+			return err
+		}
 	}
 	return shell.RemoveToolBlock(g.Name())
 }

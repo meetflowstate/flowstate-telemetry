@@ -99,6 +99,11 @@ func InstallGUIEnv(cfg config.Config, dryRun bool) error {
 	if err := os.WriteFile(GUIEnvAgentPath(), []byte(plist), 0600); err != nil {
 		return fmt.Errorf("writing LaunchAgent: %w", err)
 	}
+	// The plist holds the key: an existing file from an earlier release is
+	// made private too.
+	if err := os.Chmod(GUIEnvAgentPath(), 0600); err != nil {
+		return fmt.Errorf("securing LaunchAgent: %w", err)
+	}
 	// Set by earlier releases.
 	unsetLegacyHeaders()
 	for _, kv := range vars {

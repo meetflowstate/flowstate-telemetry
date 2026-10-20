@@ -170,7 +170,8 @@ func (c *CodexCLI) Install(cfg config.Config) error {
 	if err := os.MkdirAll(c.configDir(), 0755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
-	return os.WriteFile(c.configPath(), []byte(merged), 0600)
+	// [otel] holds the key: 0600, and an existing file is tightened.
+	return writeKeyFile(c.configPath(), []byte(merged))
 }
 
 func (c *CodexCLI) Remove() error {

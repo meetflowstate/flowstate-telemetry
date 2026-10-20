@@ -14,7 +14,8 @@ import (
 // CopilotChat configures telemetry for GitHub Copilot Chat in VS Code.
 //
 // exporterType "otlp-http" makes the extension append /v1/{traces,logs,
-// metrics} to otlpEndpoint. The key goes only in the
+// metrics} to otlpEndpoint and send OTLP/HTTP JSON (the OpenTelemetry JS
+// otlp-http exporters). The key goes only in the
 // `github.copilot.chat.otel.headers` setting (VS Code 1.138+): it is never
 // exported as OTEL_EXPORTER_OTLP_HEADERS, which every OTel SDK would send to
 // its own collector, so older builds without the setting cannot authenticate.
@@ -134,7 +135,7 @@ func (c *CopilotChat) writeSettings(settings map[string]interface{}) error {
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
 	// The file holds the key (github.copilot.chat.otel.headers): a new file
-	// is private (0600); an existing file keeps its mode.
+	// is private (0600); Install tightens an existing one (tightenMode).
 	return os.WriteFile(c.settingsPath(), data, 0600)
 }
 
@@ -161,10 +162,19 @@ func (c *CopilotChat) Install(cfg config.Config) error {
 		return nil
 	}
 
-	return c.writeSettings(settings)
+	if err := c.writeSettings(settings); err != nil {
+		return err
+	}
+	if cfg.Key != "" {
+		return tightenMode(c.settingsPath())
+	}
+	return nil
 }
 
 func (c *CopilotChat) Remove() error {
+	if !fileExists(c.settingsPath()) {
+		return nil
+	}
 	settings, err := c.readSettings()
 	if err != nil {
 		return err

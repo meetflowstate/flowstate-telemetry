@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -746,15 +747,16 @@ func TestMergeResourceAttrs(t *testing.T) {
 }
 
 // Settings files that hold the key are created private (0600); an existing
-// file keeps its mode, stricter or not, and is never loosened.
+// file readable by group or others is tightened, and a stricter one is never
+// loosened.
 func TestKeySettingsFileModes(t *testing.T) {
 	sandbox(t)
 	withGeminiVersion(t, "0.65.0")
-	c, g, cc := &ClaudeCode{}, &GeminiCLI{}, &CopilotChat{}
+	c, g, cc, cx := &ClaudeCode{}, &GeminiCLI{}, &CopilotChat{}, &CodexCLI{}
 	if err := os.MkdirAll(cc.vsCodeSettingsDir(), 0755); err != nil {
 		t.Fatal(err)
 	}
-	paths := map[Tool]string{c: c.settingsPath(), g: g.settingsPath(), cc: cc.settingsPath()}
+	paths := map[Tool]string{c: c.settingsPath(), g: g.settingsPath(), cc: cc.settingsPath(), cx: cx.configPath()}
 	for tool, path := range paths {
 		install(t, tool, testCfg)
 		if !strings.Contains(readFile(t, path), testCfg.Key) {
@@ -763,15 +765,95 @@ func TestKeySettingsFileModes(t *testing.T) {
 		if st, _ := os.Stat(path); st.Mode().Perm() != 0600 {
 			t.Errorf("%s: new %s mode = %v, want 0600", tool.Name(), path, st.Mode().Perm())
 		}
-		for _, mode := range []os.FileMode{0400 | 0200, 0640} {
-			if err := os.Chmod(path, mode); err != nil {
+		for _, m := range []struct{ before, after os.FileMode }{
+			{0400 | 0200, 0600}, {0640, 0600}, {0644, 0600}, {0664, 0600},
+		} {
+			if err := os.Chmod(path, m.before); err != nil {
 				t.Fatal(err)
 			}
 			install(t, tool, testCfg)
-			if st, _ := os.Stat(path); st.Mode().Perm() != mode {
-				t.Errorf("%s: existing mode %v changed to %v", tool.Name(), mode, st.Mode().Perm())
+			if st, _ := os.Stat(path); st.Mode().Perm() != m.after {
+				t.Errorf("%s: existing mode %v became %v, want %v", tool.Name(), m.before, st.Mode().Perm(), m.after)
 			}
 		}
+	}
+}
+
+// A settings file or shell profile symlinked from a dotfiles repository is
+// written through: the link stays a link, the target gets the change (and is
+// tightened when it now holds the key).
+func TestSymlinkedDotfilesStayLinks(t *testing.T) {
+	home := sandbox(t)
+	dotfiles := filepath.Join(home, "dotfiles")
+	c := &ClaudeCode{}
+	links := map[string]string{
+		c.settingsPath():    filepath.Join(dotfiles, "claude.json"),
+		shell.ProfilePath(): filepath.Join(dotfiles, "zshrc"),
+	}
+	for link, target := range links {
+		writeFile(t, target, map[bool]string{true: `{"model": "opus"}`, false: "export PATH=/x\n"}[strings.HasSuffix(target, ".json")])
+		if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	install(t, c, testCfg)
+	if err := shell.WriteEnvVars(testCfg, false); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range links {
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("%s is no longer a symlink", link)
+		}
+		if !strings.Contains(readFile(t, target), "otel.flowstate.host") {
+			t.Errorf("%s not updated:\n%s", target, readFile(t, target))
+		}
+	}
+	if st, _ := os.Stat(links[c.settingsPath()]); st.Mode().Perm() != 0600 {
+		t.Errorf("symlinked settings target mode = %v, want 0600", st.Mode().Perm())
+	}
+}
+
+// Remove never creates a settings file that was not there (remove --all runs
+// every tool's Remove, detected or not).
+func TestRemove_NoFilesCreated(t *testing.T) {
+	home := sandbox(t)
+	for _, tool := range All() {
+		if err := tool.Remove(); err != nil {
+			t.Fatalf("%s remove: %v", tool.Name(), err)
+		}
+	}
+	var created []string
+	_ = filepath.Walk(home, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() {
+			created = append(created, p)
+		}
+		return nil
+	})
+	if len(created) > 0 {
+		t.Fatalf("remove created files: %v", created)
+	}
+}
+
+// Team and e-mail values are percent-encoded so ',', '=' and '%' in them
+// cannot split or corrupt the attribute list, and the merge still finds
+// (and replaces) our entries.
+func TestResourceAttributes_PercentEncoded(t *testing.T) {
+	cfg := config.Config{TeamID: "a,b=c", Email: "Zoë 100%@x.example"}
+	attrs := shell.ResourceAttributes(cfg)
+	if attrs != "flowstate.team_id=a%2Cb%3Dc,flowstate.email=Zo%C3%AB%20100%25@x.example" {
+		t.Fatalf("ResourceAttributes = %q", attrs)
+	}
+	for _, kv := range strings.Split(attrs, ",") {
+		k, v, _ := strings.Cut(kv, "=")
+		if d, err := url.PathUnescape(v); err != nil || (k == "flowstate.team_id" && d != cfg.TeamID) || (k == "flowstate.email" && d != cfg.Email) {
+			t.Errorf("%s does not decode back: %q (%v)", k, d, err)
+		}
+	}
+	if got := mergeResourceAttrs("x=1,flowstate.team_id=old%2Cvalue,flowstate%2Eemail=e", attrs); got != "x=1,"+attrs {
+		t.Errorf("merge = %q", got)
 	}
 }
 

@@ -98,15 +98,15 @@ func (q *QwenCode) Install(cfg config.Config) error {
 }
 
 func (q *QwenCode) Remove() error {
-	settings, err := q.readSettings()
-	if err != nil {
-		return err
-	}
-
-	delete(settings, "telemetry")
-
-	if err := q.writeSettings(settings); err != nil {
-		return err
+	if fileExists(q.settingsPath()) {
+		settings, err := q.readSettings()
+		if err != nil {
+			return err
+		}
+		delete(settings, "telemetry")
+		if err := q.writeSettings(settings); err != nil {
+			return err
+		}
 	}
 	return shell.RemoveToolBlock(q.Name())
 }

@@ -11,3 +11,8 @@ var CursorHookScript string
 //
 //go:embed scripts/flowstate-windsurf.sh
 var WindsurfHookScript string
+
+// AntigravityHookScript contains the bash hook script for Google Antigravity telemetry.
+//
+//go:embed scripts/flowstate-antigravity.sh
+var AntigravityHookScript string

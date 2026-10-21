@@ -10,8 +10,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// AiderTool configures telemetry for the Aider AI coding assistant.
+// AiderTool handles the Aider AI coding assistant.
+//
+// Aider has no OpenTelemetry export, so nothing is sent to Flowstate and
+// there is nothing to configure. Earlier releases set `llm-history-file` in
+// ~/.aider.conf.yml, which makes Aider write every prompt and response to a
+// local file; Install and Remove take that setting out again (only the value
+// this CLI wrote, never a history file the user chose).
 type AiderTool struct{}
+
+// legacyAiderHistoryFile is the llm-history-file earlier releases wrote.
+const legacyAiderHistoryFile = "/var/log/aider/llm-history.log"
 
 func (a *AiderTool) Name() string { return "aider" }
 
@@ -35,7 +44,7 @@ func (a *AiderTool) readConfig() (map[string]interface{}, error) {
 	}
 	var cfg map[string]interface{}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", unparseable(err))
 	}
 	if cfg == nil {
 		cfg = make(map[string]interface{})
@@ -51,34 +60,48 @@ func (a *AiderTool) writeConfig(cfg map[string]interface{}) error {
 	return os.WriteFile(a.configPath(), data, 0644)
 }
 
-func (a *AiderTool) Install(cfg config.Config) error {
+// hasLegacyHistory reports whether the config has the llm-history-file
+// setting an earlier release wrote.
+func hasLegacyHistory(cfg map[string]interface{}) bool {
+	v, _ := cfg["llm-history-file"].(string)
+	return v == legacyAiderHistoryFile
+}
+
+// removeLegacy deletes the earlier release's llm-history-file setting,
+// rewriting the config only when it was there.
+func (a *AiderTool) removeLegacy(dryRun bool) error {
 	aiderCfg, err := a.readConfig()
 	if err != nil {
 		return err
 	}
-
-	aiderCfg["llm-history-file"] = "/var/log/aider/llm-history.log"
-
-	if cfg.DryRun {
-		data, _ := yaml.Marshal(aiderCfg)
-		fmt.Printf("[dry-run] Would write to %s:\n%s\n", a.configPath(), string(data))
+	if !hasLegacyHistory(aiderCfg) {
 		return nil
 	}
-
+	delete(aiderCfg, "llm-history-file")
+	if dryRun {
+		fmt.Printf("[dry-run] Would remove llm-history-file (%s) from %s\n", legacyAiderHistoryFile, a.configPath())
+		return nil
+	}
 	return a.writeConfig(aiderCfg)
+}
+
+// Install configures nothing (Aider cannot export telemetry); it removes the
+// prompt/response history setting earlier releases wrote.
+func (a *AiderTool) Install(cfg config.Config) error {
+	return a.removeLegacy(cfg.DryRun)
+}
+
+// InstallNotes implements Noter.
+func (a *AiderTool) InstallNotes(cfg config.Config) []string {
+	return []string{"Aider has no telemetry export: nothing is sent to Flowstate. The llm-history-file setting earlier releases added (it stores full prompts and responses locally) is removed"}
 }
 
 func (a *AiderTool) Remove() error {
-	aiderCfg, err := a.readConfig()
-	if err != nil {
-		return err
-	}
-
-	delete(aiderCfg, "llm-history-file")
-
-	return a.writeConfig(aiderCfg)
+	return a.removeLegacy(false)
 }
 
+// Status reports Configured only while the earlier release's setting is
+// still there, so `remove --all` cleans it up.
 func (a *AiderTool) Status() ToolStatus {
 	st := ToolStatus{Detected: a.Detect()}
 	if !st.Detected {
@@ -91,8 +114,10 @@ func (a *AiderTool) Status() ToolStatus {
 		return st
 	}
 
-	if _, ok := aiderCfg["llm-history-file"]; ok {
+	if hasLegacyHistory(aiderCfg) {
 		st.Configured = true
+		st.Prompts = true
+		st.Details = "llm-history-file set by an earlier release (re-run install to remove it)"
 	}
 
 	return st
@@ -108,13 +133,13 @@ func (a *AiderTool) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: fmt.Sprintf("cannot read config: %v", err)}
 	}
 
-	histFile, ok := aiderCfg["llm-history-file"].(string)
-	if !ok || histFile == "" {
-		return VerifyResult{OK: false, Message: "llm-history-file not configured"}
+	if hasLegacyHistory(aiderCfg) {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("llm-history-file=%s (set by an earlier release) stores full prompts and responses locally: re-run install to remove it", legacyAiderHistoryFile)}
 	}
 
-	result := VerifyResult{OK: true, Message: fmt.Sprintf("llm-history-file=%s", histFile)}
-	result.Warning = "file watcher sidecar not yet available (V2 feature)"
-
+	result := VerifyResult{OK: true, Message: "nothing to configure: Aider has no telemetry export (nothing is sent to Flowstate)"}
+	if hist, _ := aiderCfg["llm-history-file"].(string); hist != "" {
+		result.Warning = fmt.Sprintf("llm-history-file=%s stores full prompts and responses locally", hist)
+	}
 	return result
 }

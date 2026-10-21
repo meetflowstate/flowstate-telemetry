@@ -25,18 +25,30 @@ var (
 // the layout from the workstream-A plan.
 const defaultDataDir = "/var/lib/flowstate-telemetry"
 
+// proxyDeprecation explains why the proxy is retired. The daemon posted to
+// <endpoint>/api/v1/ai-telemetry/ingest, which the OTLP/HTTP receiver at
+// otel.flowstate.host does not serve (it serves only /v1/logs, /v1/metrics
+// and /v1/traces).
+const proxyDeprecation = "the Flowstate receiver no longer accepts proxy events; " +
+	"tools send OpenTelemetry directly (flowstate-telemetry install --all). " +
+	"Remove an existing proxy with: sudo flowstate-telemetry proxy uninstall"
+
 // proxyCmd is the parent command grouping install/run/uninstall/status.
 var proxyCmd = &cobra.Command{
-	Use:   "proxy",
-	Short: "On-device HTTPS interceptor for AI provider traffic",
-	Long: `proxy manages the local HTTPS interceptor daemon. The daemon binds a
+	Use:        "proxy",
+	Short:      "Deprecated: on-device HTTPS interceptor for AI provider traffic",
+	Deprecated: proxyDeprecation,
+	Long: `DEPRECATED: ` + proxyDeprecation + `
+
+proxy manages the local HTTPS interceptor daemon. The daemon binds a
 high local port, registers itself via PAC, and selectively MITMs traffic
 destined for known AI provider hosts. Non-AI hosts are tunneled raw with
 their original certificate chain intact.
 
 Subcommands:
-  install      Generate CA, install trust, install service, register PAC, start daemon (sudo)
-  run          Run the daemon in the foreground (what the launchd service invokes)
+  install      Disabled (deprecated)
+  run          Run the daemon in the foreground (what the launchd service invokes);
+               it now only tunnels, intercepting and sending nothing
   uninstall    Reverse install: stop service, remove trust, unregister PAC, delete data (sudo)
   status       Report daemon health, allowlist version, and trust verification`,
 }
@@ -76,58 +88,17 @@ func init() {
 	rootCmd.AddCommand(proxyCmd)
 }
 
-// runProxyInstall performs the full install sequence: generate CA, install
-// trust, install service, register PAC. It does NOT start the daemon
-// directly — that's launchd's job once the service plist is bootstrapped.
+// runProxyInstall refuses: the proxy is deprecated (proxyDeprecation).
 func runProxyInstall(cmd *cobra.Command, args []string) error {
-	cfg := config.FromEnv(flagEndpoint, flagKey)
-	cfg.Verbose = flagVerbose
-
-	caDir := filepath.Join(flagProxyDataDir, "ca")
-	cert, _, err := proxy.GenerateOrLoadCA(caDir)
-	if err != nil {
-		return fmt.Errorf("ca: %w", err)
-	}
-
-	certPath := filepath.Join(caDir, "ca.crt")
-	fmt.Printf("CA at %s\n", certPath)
-	fmt.Printf("CA fingerprint (SHA-256): %s\n", proxy.CertFingerprintSHA256(cert))
-
-	plat := platform.New()
-
-	if err := plat.InstallTrust(certPath); err != nil {
-		return fmt.Errorf("install trust: %w", err)
-	}
-	fmt.Println("CA installed in system trust store.")
-
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locate executable: %w", err)
-	}
-	if err := plat.InstallService(exe); err != nil {
-		return fmt.Errorf("install service: %w", err)
-	}
-	fmt.Println("Daemon service installed.")
-
-	pacURL := fmt.Sprintf("http://127.0.0.1:%d/proxy.pac", flagProxyPort)
-	if err := plat.InstallPAC(pacURL); err != nil {
-		return fmt.Errorf("install PAC: %w", err)
-	}
-	fmt.Printf("PAC registered: %s\n", pacURL)
-
-	fmt.Println("Install complete. The daemon is running under launchd.")
-	fmt.Printf("Endpoint: %s\n", cfg.Endpoint)
-	if cfg.Key == "" {
-		fmt.Fprintln(os.Stderr, "Warning: no telemetry key set (FLOWSTATE_OTLP_KEY). Daemon will run but events will not be authenticated.")
-	}
-	return nil
+	return fmt.Errorf("proxy install is disabled: %s", proxyDeprecation)
 }
 
-// runProxyRun is what launchd invokes. It runs the daemon in the foreground
-// until interrupted. Logs to stdout/stderr — launchd captures them.
+// runProxyRun is what launchd invokes for an install made before the proxy
+// was deprecated. Machines still route traffic through it (PAC), so it keeps
+// running, but only as a plain tunnel: the allowlist is empty, so nothing is
+// intercepted, and no events are sent (the ingest endpoint is gone).
 func runProxyRun(cmd *cobra.Command, args []string) error {
-	cfg := config.FromEnv(flagEndpoint, flagKey)
-	cfg.Verbose = flagVerbose
+	fmt.Fprintln(os.Stderr, "flowstate-telemetry proxy is deprecated and now only tunnels traffic: "+proxyDeprecation)
 
 	caDir := filepath.Join(flagProxyDataDir, "ca")
 	cert, key, err := proxy.GenerateOrLoadCA(caDir)
@@ -135,26 +106,11 @@ func runProxyRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ca: %w", err)
 	}
 
-	allow := proxy.NewAllowlist(proxy.SeedAllowlist)
-
-	var emitter proxy.EventEmitter
-	if cfg.Endpoint != "" {
-		fwd, err := proxy.NewForwarder(proxy.ForwarderConfig{
-			Endpoint: cfg.Endpoint,
-			Key:      cfg.Key,
-		})
-		if err != nil {
-			return fmt.Errorf("forwarder: %w", err)
-		}
-		emitter = fwd
-	}
-
 	d, err := proxy.New(proxy.DaemonConfig{
 		Port:      flagProxyPort,
 		CA:        cert,
 		CAKey:     key,
-		Allowlist: allow,
-		Emitter:   emitter,
+		Allowlist: proxy.NewAllowlist(nil),
 		Verbose:   flagVerbose,
 	})
 	if err != nil {

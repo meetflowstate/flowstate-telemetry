@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +12,15 @@ import (
 
 // WindsurfTool configures telemetry hooks for the Windsurf (Codeium) editor.
 type WindsurfTool struct{}
+
+// windsurfEvents are the Cascade hooks the Flowstate script is registered
+// for. post_cascade_response_with_transcript is deliberately not used: the
+// script never uploads transcripts.
+var windsurfEvents = []string{
+	"pre_user_prompt",
+	"post_write_code",
+	"post_cascade_response",
+}
 
 func (w *WindsurfTool) Name() string { return "windsurf" }
 
@@ -50,111 +58,43 @@ func (w *WindsurfTool) Detect() bool {
 	return false
 }
 
-func (w *WindsurfTool) readHooksConfig() (map[string]interface{}, error) {
-	data, err := os.ReadFile(w.hooksConfigPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]interface{}), nil
-		}
-		return nil, fmt.Errorf("reading hooks.json: %w", err)
-	}
-	var cfg map[string]interface{}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing hooks.json: %w", err)
-	}
-	return cfg, nil
-}
-
-func (w *WindsurfTool) writeHooksConfig(cfg map[string]interface{}) error {
-	dir := filepath.Dir(w.hooksConfigPath())
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating directory: %w", err)
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling hooks.json: %w", err)
-	}
-	return os.WriteFile(w.hooksConfigPath(), data, 0644)
-}
-
 func (w *WindsurfTool) Install(cfg config.Config) error {
-	// Write hook script
-	if err := os.MkdirAll(w.hooksDir(), 0755); err != nil {
-		return fmt.Errorf("creating hooks directory: %w", err)
-	}
-
-	if cfg.DryRun {
-		fmt.Printf("[dry-run] Would write hook script to %s\n", w.hookScriptPath())
-		fmt.Printf("[dry-run] Would write hooks config to %s\n", w.hooksConfigPath())
-		return nil
-	}
-
-	if err := os.WriteFile(w.hookScriptPath(), []byte(hooks.WindsurfHookScript), 0755); err != nil {
-		return fmt.Errorf("writing hook script: %w", err)
-	}
-
-	// Write hooks.json
-	hooksCfg, err := w.readHooksConfig()
+	hooksCfg, err := readJSONFile(w.hooksConfigPath())
 	if err != nil {
 		return err
 	}
-
-	hookCmd := map[string]interface{}{"command": w.hookScriptPath()}
 
 	hooksBlock, ok := hooksCfg["hooks"].(map[string]interface{})
 	if !ok {
 		hooksBlock = make(map[string]interface{})
 	}
-
-	events := []string{
-		"pre_user_prompt",
-		"post_cascade_response_with_transcript",
-		"post_write_code",
-		"post_run_command",
-		"post_mcp_tool_use",
-	}
-
-	for _, event := range events {
-		existing := w.getExistingHooks(hooksBlock, event)
-		merged := w.mergeHookEntry(existing, hookCmd)
-		hooksBlock[event] = merged
-	}
-
+	addFlowstateHooks(hooksBlock, w.hookScriptPath(), windsurfEvents, map[string]interface{}{"show_output": false})
 	hooksCfg["hooks"] = hooksBlock
 
-	return w.writeHooksConfig(hooksCfg)
-}
-
-func (w *WindsurfTool) getExistingHooks(hooksBlock map[string]interface{}, event string) []interface{} {
-	raw, ok := hooksBlock[event]
-	if !ok {
+	if cfg.DryRun {
+		fmt.Printf("[dry-run] Would write hook script to %s\n", w.hookScriptPath())
+		fmt.Printf("[dry-run] Would write %s\n", hooks.EnvFilePath())
+		fmt.Printf("[dry-run] Would register hooks in %s: %v\n", w.hooksConfigPath(), windsurfEvents)
 		return nil
 	}
-	arr, ok := raw.([]interface{})
-	if !ok {
-		return nil
-	}
-	return arr
-}
 
-func (w *WindsurfTool) mergeHookEntry(existing []interface{}, newEntry map[string]interface{}) []interface{} {
-	newCmd, _ := newEntry["command"].(string)
-	for _, e := range existing {
-		m, ok := e.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if cmd, ok := m["command"].(string); ok && cmd == newCmd {
-			return existing
-		}
+	if err := os.MkdirAll(w.hooksDir(), 0755); err != nil {
+		return fmt.Errorf("creating hooks directory: %w", err)
 	}
-	return append(existing, newEntry)
+	if err := os.WriteFile(w.hookScriptPath(), []byte(hooks.WindsurfHookScript), 0755); err != nil {
+		return fmt.Errorf("writing hook script: %w", err)
+	}
+	if err := hooks.WriteEnvFile(cfg); err != nil {
+		return err
+	}
+
+	return writeJSONFile(w.hooksConfigPath(), hooksCfg, 0644)
 }
 
 func (w *WindsurfTool) Remove() error {
 	_ = os.Remove(w.hookScriptPath())
 
-	hooksCfg, err := w.readHooksConfig()
+	hooksCfg, err := readJSONFile(w.hooksConfigPath())
 	if err != nil {
 		return err
 	}
@@ -163,24 +103,7 @@ func (w *WindsurfTool) Remove() error {
 	if !ok {
 		return nil
 	}
-
-	events := []string{
-		"pre_user_prompt",
-		"post_cascade_response_with_transcript",
-		"post_write_code",
-		"post_run_command",
-		"post_mcp_tool_use",
-	}
-
-	for _, event := range events {
-		existing := w.getExistingHooks(hooksBlock, event)
-		filtered := w.removeFlowstateHook(existing)
-		if len(filtered) == 0 {
-			delete(hooksBlock, event)
-		} else {
-			hooksBlock[event] = filtered
-		}
-	}
+	stripFlowstateHooks(hooksBlock, w.hookScriptPath())
 
 	if len(hooksBlock) == 0 {
 		delete(hooksCfg, "hooks")
@@ -188,23 +111,21 @@ func (w *WindsurfTool) Remove() error {
 		hooksCfg["hooks"] = hooksBlock
 	}
 
-	return w.writeHooksConfig(hooksCfg)
+	return writeJSONFile(w.hooksConfigPath(), hooksCfg, 0644)
 }
 
-func (w *WindsurfTool) removeFlowstateHook(hooksList []interface{}) []interface{} {
-	var result []interface{}
-	for _, h := range hooksList {
-		m, ok := h.(map[string]interface{})
-		if !ok {
-			result = append(result, h)
-			continue
-		}
-		cmd, ok := m["command"].(string)
-		if !ok || cmd != w.hookScriptPath() {
-			result = append(result, h)
+func (w *WindsurfTool) registered() bool {
+	hooksCfg, err := readJSONFile(w.hooksConfigPath())
+	if err != nil {
+		return false
+	}
+	hooksBlock, _ := hooksCfg["hooks"].(map[string]interface{})
+	for _, event := range windsurfEvents {
+		if !hasFlowstateHook(hooksBlock, w.hookScriptPath(), event) {
+			return false
 		}
 	}
-	return result
+	return true
 }
 
 func (w *WindsurfTool) Status() ToolStatus {
@@ -221,17 +142,6 @@ func (w *WindsurfTool) Status() ToolStatus {
 }
 
 func (w *WindsurfTool) Verify(cfg config.Config) VerifyResult {
-	if !w.Detect() {
-		return VerifyResult{OK: false, Message: "Windsurf not detected"}
-	}
-
-	if _, err := os.Stat(w.hookScriptPath()); err != nil {
-		return VerifyResult{OK: false, Message: fmt.Sprintf("%s not found", w.hookScriptPath())}
-	}
-
-	if _, err := os.Stat(w.hooksConfigPath()); err != nil {
-		return VerifyResult{OK: false, Message: fmt.Sprintf("%s not found", w.hooksConfigPath())}
-	}
-
-	return VerifyResult{OK: true, Message: "hook script and hooks.json present"}
+	return verifyHookTool(w.Detect(), "Windsurf", w.hookScriptPath(), w.hooksConfigPath(), w.registered(),
+		"hooks do not run in Restricted Mode")
 }

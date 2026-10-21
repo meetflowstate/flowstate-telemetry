@@ -51,8 +51,9 @@ var rootCmd = &cobra.Command{
 	Short:   "Configure developer machines to emit AI coding tool telemetry to Flowstate",
 	Version: VersionString(),
 	Long: `flowstate-telemetry configures developer machines to emit OpenTelemetry
-data from AI coding tools (Claude Code, Copilot Chat, Gemini CLI, Codex,
-Cursor, Windsurf, Aider, Qwen Code, OpenCode) to Flowstate's OTel collector.
+data from AI coding tools (Claude Code, Copilot Chat, Copilot CLI, Gemini CLI,
+Codex, Cursor, Windsurf, Antigravity, Aider, Qwen Code, OpenCode) to
+Flowstate's OTLP/HTTP receiver.
 
 It can be run interactively on a developer's machine or used to generate
 MDM deployment artefacts for fleet-wide rollout.`,
@@ -78,7 +79,7 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&flagEndpoint, "endpoint", "", "OTel collector endpoint (env: FLOWSTATE_OTLP_ENDPOINT)")
+	rootCmd.PersistentFlags().StringVar(&flagEndpoint, "endpoint", "", "OTLP/HTTP receiver base URL (env: FLOWSTATE_OTLP_ENDPOINT, default https://otel.flowstate.host)")
 	rootCmd.PersistentFlags().StringVar(&flagKey, "key", "", "Flowstate API key (env: FLOWSTATE_OTLP_KEY)")
 	rootCmd.PersistentFlags().BoolVar(&flagVerbose, "verbose", false, "Enable debug logging")
 

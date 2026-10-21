@@ -15,6 +15,9 @@ type VerifyResult struct {
 	OK      bool
 	Message string
 	Warning string
+	// Notes are informational lines printed under the result; they do not
+	// affect the exit code.
+	Notes []string
 }
 
 // Tool is the interface that each AI coding tool must implement
@@ -27,6 +30,11 @@ type Tool interface {
 	Remove() error
 	Status() ToolStatus
 	Verify(cfg config.Config) VerifyResult
+}
+
+// Noter is implemented by tools with advice to print after install.
+type Noter interface {
+	InstallNotes(cfg config.Config) []string
 }
 
 var registry []Tool
@@ -54,11 +62,13 @@ func ByName(name string) (Tool, bool) {
 func init() {
 	Register(&ClaudeCode{})
 	Register(&CopilotChat{})
+	Register(&CopilotCLI{})
 	Register(&GeminiCLI{})
 	Register(&CodexCLI{})
 	Register(&QwenCode{})
 	Register(&CursorTool{})
 	Register(&WindsurfTool{})
+	Register(&AntigravityTool{})
 	Register(&AiderTool{})
 	Register(&OpenCodeTool{})
 }

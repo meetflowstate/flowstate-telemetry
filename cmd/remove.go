@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
+	"github.com/meetflowstate/flowstate-telemetry/internal/hooks"
 	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 	"github.com/meetflowstate/flowstate-telemetry/internal/tools"
 	"github.com/spf13/cobra"
@@ -18,13 +20,16 @@ var removeCmd = &cobra.Command{
 	Use:   "remove",
 	Short: "Remove Flowstate telemetry configuration from AI tools",
 	Long: `Remove reverses the install command, removing Flowstate telemetry
-configuration from AI coding tools and cleaning up shell environment variables.`,
+configuration from AI coding tools and cleaning up shell environment variables.
+
+--all cleans every tool's files whether or not the tool is still installed or
+detected, so no key is left behind in a settings file.`,
 	RunE: runRemove,
 }
 
 func init() {
 	removeCmd.Flags().StringVar(&flagRemoveTool, "tool", "", "Remove only this tool (e.g. claude-code, copilot-chat)")
-	removeCmd.Flags().BoolVar(&flagRemoveAll, "all", false, "Remove from all configured tools")
+	removeCmd.Flags().BoolVar(&flagRemoveAll, "all", false, "Remove from every tool, detected or not")
 	rootCmd.AddCommand(removeCmd)
 }
 
@@ -34,16 +39,14 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	var toolsToRemove []tools.Tool
+	// Configured before removal, for the report: with --all every tool is
+	// cleaned, detected or not (the key may sit in ~/.claude/settings.json
+	// after the claude command itself was uninstalled). Each Remove is a
+	// no-op when none of its files exist.
+	configured := map[string]bool{}
 
 	if flagRemoveAll {
-		for _, t := range tools.All() {
-			st := t.Status()
-			if st.Configured {
-				toolsToRemove = append(toolsToRemove, t)
-			} else if flagVerbose {
-				fmt.Printf("  Skipping %s (not configured)\n", t.Name())
-			}
-		}
+		toolsToRemove = tools.All()
 	} else {
 		t, ok := tools.ByName(flagRemoveTool)
 		if !ok {
@@ -51,21 +54,31 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		}
 		toolsToRemove = append(toolsToRemove, t)
 	}
-
-	if len(toolsToRemove) == 0 {
-		fmt.Println("No configured tools found. Nothing to remove.")
-		return nil
+	for _, t := range toolsToRemove {
+		configured[t.Name()] = !flagRemoveAll || t.Status().Configured
 	}
 
 	var succeeded, failed int
 
 	for _, t := range toolsToRemove {
 		if err := t.Remove(); err != nil {
+			// A file --all cannot parse, for a tool not detected as
+			// configured, holds nothing of ours that we could find: warn and
+			// leave it. A named or configured tool still fails.
+			if flagRemoveAll && !configured[t.Name()] && errors.Is(err, tools.ErrUnparseable) {
+				fmt.Fprintf(os.Stderr, "  %s: warning: %v (not configured; left unchanged)\n", t.Name(), err)
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "  %s: error: %v\n", t.Name(), err)
 			failed++
-		} else {
+			continue
+		}
+		switch {
+		case configured[t.Name()]:
 			fmt.Printf("  %s: removed\n", t.Name())
 			succeeded++
+		case flagVerbose:
+			fmt.Printf("  %s: cleaned (not detected as configured)\n", t.Name())
 		}
 	}
 
@@ -75,6 +88,12 @@ func runRemove(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "  Warning: could not clean shell profile: %v\n", err)
 		} else {
 			fmt.Printf("  Shell env vars removed from %s\n", shell.ProfilePath())
+		}
+		if err := hooks.RemoveEnvFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not remove %s: %v\n", hooks.EnvFilePath(), err)
+		}
+		if err := shell.RemoveGUIEnv(); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: could not remove GUI env vars: %v\n", err)
 		}
 	}
 

@@ -2,15 +2,23 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 
 	"github.com/meetflowstate/flowstate-telemetry/internal/config"
+	"github.com/meetflowstate/flowstate-telemetry/internal/shell"
 )
 
 // QwenCode configures telemetry for Alibaba's Qwen Code CLI.
+//
+// Same telemetry block as Gemini CLI (it is a fork), except Qwen has no
+// header setting: the key reaches it only through OTEL_EXPORTER_OTLP_HEADERS,
+// set by a `qwen` wrapper function in the shell profile (never exported
+// globally). With otlpProtocol "http" it appends /v1/{logs,metrics,traces}
+// and sends OTLP/HTTP JSON.
 type QwenCode struct{}
 
 func (q *QwenCode) Name() string { return "qwen-code" }
@@ -44,7 +52,7 @@ func (q *QwenCode) readSettings() (map[string]interface{}, error) {
 	}
 	var settings map[string]interface{}
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, fmt.Errorf("parsing settings: %w", err)
+		return nil, fmt.Errorf("parsing settings: %w", unparseable(err))
 	}
 	return settings, nil
 }
@@ -66,38 +74,41 @@ func (q *QwenCode) Install(cfg config.Config) error {
 		return err
 	}
 
+	// logPrompts defaults to true in Qwen, so it is always written.
 	telemetry := map[string]interface{}{
 		"enabled":      true,
 		"target":       "local",
-		"otlpEndpoint": cfg.Endpoint,
-		"otlpProtocol": "grpc",
-		"logPrompts":   false,
-	}
-
-	if cfg.Prompts {
-		telemetry["logPrompts"] = true
+		"otlpEndpoint": cfg.BaseEndpoint(),
+		"otlpProtocol": "http",
+		"logPrompts":   cfg.Prompts,
 	}
 
 	settings["telemetry"] = telemetry
+	block := geminiStyleBlock("qwen", "Qwen Code", true, cfg)
 
 	if cfg.DryRun {
 		data, _ := json.MarshalIndent(settings, "", "  ")
-		fmt.Printf("[dry-run] Would write to %s:\n%s\n", q.settingsPath(), string(data))
-		return nil
+		fmt.Printf("[dry-run] Would write to %s:\n%s\n", q.settingsPath(), redactKey(string(data), cfg.Key))
+		return shell.WriteToolBlock(q.Name(), block, true)
 	}
 
-	return q.writeSettings(settings)
+	if err := q.writeSettings(settings); err != nil {
+		return err
+	}
+	return shell.WriteToolBlock(q.Name(), block, false)
 }
 
 func (q *QwenCode) Remove() error {
-	settings, err := q.readSettings()
-	if err != nil {
-		return err
+	// The shell block is removed even when the settings file cannot be.
+	var err error
+	if fileExists(q.settingsPath()) {
+		var settings map[string]interface{}
+		if settings, err = q.readSettings(); err == nil {
+			delete(settings, "telemetry")
+			err = q.writeSettings(settings)
+		}
 	}
-
-	delete(settings, "telemetry")
-
-	return q.writeSettings(settings)
+	return errors.Join(err, shell.RemoveToolBlock(q.Name()))
 }
 
 func (q *QwenCode) Status() ToolStatus {
@@ -148,10 +159,5 @@ func (q *QwenCode) Verify(cfg config.Config) VerifyResult {
 		return VerifyResult{OK: false, Message: "telemetry not enabled"}
 	}
 
-	result := VerifyResult{OK: true, Message: "settings.json present · telemetry enabled"}
-	if logPrompts, ok := telemetry["logPrompts"].(bool); !ok || !logPrompts {
-		result.Warning = "logPrompts not enabled (re-run with --prompts)"
-	}
-
-	return result
+	return verifyGeminiStyle(telemetry, cfg, "QWEN_TELEMETRY_OTLP_ENDPOINT", q.Name(), "qwen", false)
 }

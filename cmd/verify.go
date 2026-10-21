@@ -12,11 +12,13 @@ import (
 var verifyCmd = &cobra.Command{
 	Use:   "verify",
 	Short: "Verify telemetry configuration for all detected tools",
-	Long: `Verify checks the configuration of each detected AI tool and
-reports whether telemetry is correctly configured. For tools with OTel
-endpoints, it optionally sends a test event.
+	Long: `Verify checks this machine's configuration without sending anything:
+the environment (left-over global OTEL_* variables, the retired endpoint, the
+shell profile, the --gui-env LaunchAgent, machine-wide files) and, for each
+detected AI tool, its local settings files and wrapper functions.
 
-Exit code 0 if all detected tools pass. Exit code 1 if any have warnings or errors.`,
+Exit code 0 if every check passes. Exit code 1 if any check fails or has a
+warning.`,
 	RunE: runVerify,
 }
 
@@ -31,34 +33,46 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	hasErrors := false
 	hasWarnings := false
 
+	report := func(name string, result tools.VerifyResult) {
+		if result.OK {
+			if result.Warning != "" {
+				fmt.Printf("\u26a0  %-16s %s\n", name, result.Warning)
+				hasWarnings = true
+			} else {
+				fmt.Printf("\u2713  %-16s %s\n", name, result.Message)
+			}
+		} else {
+			fmt.Printf("\u2717  %-16s %s\n", name, result.Message)
+			if result.Warning != "" {
+				fmt.Printf("\u26a0  %-16s %s\n", "", result.Warning)
+			}
+			hasErrors = true
+		}
+		for _, note := range result.Notes {
+			fmt.Printf("   %-16s note: %s\n", "", note)
+		}
+	}
+
+	if cfg.IgnoredLegacyEndpoint != "" {
+		fmt.Printf("   %-16s note: ignoring retired endpoint %s; checking against %s\n", "", cfg.IgnoredLegacyEndpoint, cfg.BaseEndpoint())
+	}
+	report("environment", tools.VerifyEnvironment(cfg))
+
 	for _, t := range tools.All() {
 		if !t.Detect() {
 			fmt.Printf("\u2013  %-16s not detected on PATH\n", t.Name())
 			continue
 		}
-
-		result := t.Verify(cfg)
-
-		if result.OK {
-			if result.Warning != "" {
-				fmt.Printf("\u26a0  %-16s %s\n", t.Name(), result.Warning)
-				hasWarnings = true
-			} else {
-				fmt.Printf("\u2713  %-16s %s\n", t.Name(), result.Message)
-			}
-		} else {
-			fmt.Printf("\u2717  %-16s %s\n", t.Name(), result.Message)
-			hasErrors = true
-		}
+		report(t.Name(), t.Verify(cfg))
 	}
 
 	if hasErrors || hasWarnings {
 		fmt.Fprintln(os.Stderr)
 		if hasErrors {
-			fmt.Fprintln(os.Stderr, "Some tools have configuration errors. Run 'flowstate-telemetry install --all' to fix.")
+			fmt.Fprintln(os.Stderr, "Some checks failed. Run 'flowstate-telemetry install --all' to fix.")
 		}
 		if hasWarnings {
-			fmt.Fprintln(os.Stderr, "Some tools have warnings. Run 'flowstate-telemetry install --all --prompts' for full capture.")
+			fmt.Fprintln(os.Stderr, "Some checks have warnings; see the lines marked \u26a0 above.")
 		}
 		os.Exit(1)
 	}

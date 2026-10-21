@@ -1,0 +1,15 @@
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "MY_VAR": "keep",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otel.flowstate.host",
+    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowstate-key=fs_test_key",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true",
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "true"
+  },
+  "model": "opus"
+}

@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +12,20 @@ import (
 
 // CursorTool configures telemetry hooks for the Cursor editor.
 type CursorTool struct{}
+
+// cursorEvents are the Cursor hooks the Flowstate script is registered for.
+// All are observe-only; beforeSubmitPrompt is answered with
+// {"continue": true}. Permission hooks (beforeShellExecution,
+// beforeMCPExecution) are deliberately not used: a malformed answer there
+// blocks the action.
+var cursorEvents = []string{
+	"sessionStart",
+	"beforeSubmitPrompt",
+	"afterFileEdit",
+	"afterTabFileEdit",
+	"stop",
+	"sessionEnd",
+}
 
 func (c *CursorTool) Name() string { return "cursor" }
 
@@ -45,105 +58,44 @@ func (c *CursorTool) Detect() bool {
 	return false
 }
 
-func (c *CursorTool) readHooksConfig() (map[string]interface{}, error) {
-	data, err := os.ReadFile(c.hooksConfigPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]interface{}), nil
-		}
-		return nil, fmt.Errorf("reading hooks.json: %w", err)
-	}
-	var cfg map[string]interface{}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing hooks.json: %w", err)
-	}
-	return cfg, nil
-}
-
-func (c *CursorTool) writeHooksConfig(cfg map[string]interface{}) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling hooks.json: %w", err)
-	}
-	return os.WriteFile(c.hooksConfigPath(), data, 0644)
-}
-
 func (c *CursorTool) Install(cfg config.Config) error {
-	// Write hook script
-	if err := os.MkdirAll(c.hooksDir(), 0755); err != nil {
-		return fmt.Errorf("creating hooks directory: %w", err)
-	}
-
-	if cfg.DryRun {
-		fmt.Printf("[dry-run] Would write hook script to %s\n", c.hookScriptPath())
-		fmt.Printf("[dry-run] Would write hooks config to %s\n", c.hooksConfigPath())
-		return nil
-	}
-
-	if err := os.WriteFile(c.hookScriptPath(), []byte(hooks.CursorHookScript), 0755); err != nil {
-		return fmt.Errorf("writing hook script: %w", err)
-	}
-
-	// Write hooks.json
-	hooksCfg, err := c.readHooksConfig()
+	hooksCfg, err := readJSONFile(c.hooksConfigPath())
 	if err != nil {
 		return err
 	}
-
-	hookCmd := map[string]interface{}{"command": c.hookScriptPath()}
-	hookEntry := []interface{}{hookCmd}
 
 	hooksBlock, ok := hooksCfg["hooks"].(map[string]interface{})
 	if !ok {
 		hooksBlock = make(map[string]interface{})
 	}
-
-	// Add flowstate hook to each event type, preserving existing hooks
-	for _, event := range []string{"stop", "beforeMCPExecution", "beforeShellExecution", "afterFileEdit"} {
-		existing := c.getExistingHooks(hooksBlock, event)
-		merged := c.mergeHookEntry(existing, hookCmd)
-		hooksBlock[event] = merged
-	}
-
+	addFlowstateHooks(hooksBlock, c.hookScriptPath(), cursorEvents, nil)
 	hooksCfg["version"] = float64(1)
 	hooksCfg["hooks"] = hooksBlock
-	_ = hookEntry // used indirectly above
 
-	return c.writeHooksConfig(hooksCfg)
-}
-
-func (c *CursorTool) getExistingHooks(hooksBlock map[string]interface{}, event string) []interface{} {
-	raw, ok := hooksBlock[event]
-	if !ok {
+	if cfg.DryRun {
+		fmt.Printf("[dry-run] Would write hook script to %s\n", c.hookScriptPath())
+		fmt.Printf("[dry-run] Would write %s\n", hooks.EnvFilePath())
+		fmt.Printf("[dry-run] Would register hooks in %s: %v\n", c.hooksConfigPath(), cursorEvents)
 		return nil
 	}
-	arr, ok := raw.([]interface{})
-	if !ok {
-		return nil
-	}
-	return arr
-}
 
-func (c *CursorTool) mergeHookEntry(existing []interface{}, newEntry map[string]interface{}) []interface{} {
-	newCmd, _ := newEntry["command"].(string)
-	for _, e := range existing {
-		m, ok := e.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if cmd, ok := m["command"].(string); ok && cmd == newCmd {
-			return existing // already present
-		}
+	if err := os.MkdirAll(c.hooksDir(), 0755); err != nil {
+		return fmt.Errorf("creating hooks directory: %w", err)
 	}
-	return append(existing, newEntry)
+	if err := os.WriteFile(c.hookScriptPath(), []byte(hooks.CursorHookScript), 0755); err != nil {
+		return fmt.Errorf("writing hook script: %w", err)
+	}
+	if err := hooks.WriteEnvFile(cfg); err != nil {
+		return err
+	}
+
+	return writeJSONFile(c.hooksConfigPath(), hooksCfg, 0644)
 }
 
 func (c *CursorTool) Remove() error {
-	// Remove hook script
 	_ = os.Remove(c.hookScriptPath())
 
-	// Clean up hooks.json
-	hooksCfg, err := c.readHooksConfig()
+	hooksCfg, err := readJSONFile(c.hooksConfigPath())
 	if err != nil {
 		return err
 	}
@@ -152,16 +104,7 @@ func (c *CursorTool) Remove() error {
 	if !ok {
 		return nil
 	}
-
-	for _, event := range []string{"stop", "beforeMCPExecution", "beforeShellExecution", "afterFileEdit"} {
-		existing := c.getExistingHooks(hooksBlock, event)
-		filtered := c.removeFlowstateHook(existing)
-		if len(filtered) == 0 {
-			delete(hooksBlock, event)
-		} else {
-			hooksBlock[event] = filtered
-		}
-	}
+	stripFlowstateHooks(hooksBlock, c.hookScriptPath())
 
 	if len(hooksBlock) == 0 {
 		delete(hooksCfg, "hooks")
@@ -169,23 +112,21 @@ func (c *CursorTool) Remove() error {
 		hooksCfg["hooks"] = hooksBlock
 	}
 
-	return c.writeHooksConfig(hooksCfg)
+	return writeJSONFile(c.hooksConfigPath(), hooksCfg, 0644)
 }
 
-func (c *CursorTool) removeFlowstateHook(hooks []interface{}) []interface{} {
-	var result []interface{}
-	for _, h := range hooks {
-		m, ok := h.(map[string]interface{})
-		if !ok {
-			result = append(result, h)
-			continue
-		}
-		cmd, ok := m["command"].(string)
-		if !ok || cmd != c.hookScriptPath() {
-			result = append(result, h)
+func (c *CursorTool) registered() bool {
+	hooksCfg, err := readJSONFile(c.hooksConfigPath())
+	if err != nil {
+		return false
+	}
+	hooksBlock, _ := hooksCfg["hooks"].(map[string]interface{})
+	for _, event := range cursorEvents {
+		if !hasFlowstateHook(hooksBlock, c.hookScriptPath(), event) {
+			return false
 		}
 	}
-	return result
+	return true
 }
 
 func (c *CursorTool) Status() ToolStatus {
@@ -198,32 +139,36 @@ func (c *CursorTool) Status() ToolStatus {
 		st.Configured = true
 	}
 
-	if _, err := os.Stat(c.hooksConfigPath()); err == nil {
-		hooksCfg, err := c.readHooksConfig()
-		if err == nil {
-			if hooksBlock, ok := hooksCfg["hooks"].(map[string]interface{}); ok {
-				if _, ok := hooksBlock["stop"]; ok {
-					st.Configured = true
-				}
-			}
-		}
-	}
-
 	return st
 }
 
 func (c *CursorTool) Verify(cfg config.Config) VerifyResult {
-	if !c.Detect() {
-		return VerifyResult{OK: false, Message: "Cursor not detected"}
-	}
+	return verifyHookTool(c.Detect(), "Cursor", c.hookScriptPath(), c.hooksConfigPath(), c.registered(),
+		"hooks.json is read when Cursor starts: restart Cursor after install")
+}
 
-	if _, err := os.Stat(c.hookScriptPath()); err != nil {
-		return VerifyResult{OK: false, Message: fmt.Sprintf("%s not found", c.hookScriptPath())}
+// verifyHookTool is the shared Verify for hook-script tools.
+func verifyHookTool(detected bool, product, script, hooksPath string, registered bool, notes ...string) VerifyResult {
+	if !detected {
+		return VerifyResult{OK: false, Message: product + " not detected"}
 	}
-
-	if _, err := os.Stat(c.hooksConfigPath()); err != nil {
-		return VerifyResult{OK: false, Message: fmt.Sprintf("%s not found", c.hooksConfigPath())}
+	if _, err := os.Stat(script); err != nil {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("%s not found", script)}
 	}
-
-	return VerifyResult{OK: true, Message: "hook script and hooks.json present"}
+	if !registered {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("Flowstate hooks missing from %s", hooksPath)}
+	}
+	var warnings []string
+	envFile, err := os.ReadFile(hooks.EnvFilePath())
+	if err != nil && os.Getenv("FLOWSTATE_OTLP_KEY") == "" {
+		warnings = append(warnings, fmt.Sprintf("%s missing: hooks will post without a key", hooks.EnvFilePath()))
+	}
+	if config.ContainsLegacyEndpoint(string(envFile)) {
+		return VerifyResult{OK: false, Message: fmt.Sprintf("%s points at the retired otel.flowstate.inc receiver: re-run `flowstate-telemetry install`", hooks.EnvFilePath())}
+	}
+	if !commandAvailable("jq") || !commandAvailable("curl") {
+		warnings = append(warnings, "jq and curl are required by the hook script")
+	}
+	return VerifyResult{OK: true, Message: "hook script and hooks.json present · OTLP/HTTP JSON to /v1/logs",
+		Warning: joinWarnings(warnings), Notes: notes}
 }
